@@ -1,7 +1,6 @@
 package com.example.raspberrycontroller
 
 import android.app.AlertDialog
-import android.content.Intent
 import android.os.Bundle
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -39,22 +38,19 @@ import java.net.URL
 
 class MainActivity : FragmentActivity() {
 
-    private lateinit var easterEgg: EasterEggManager
     // URL du fichier texte contenant uniquement le numéro de version (ex: 3)
-    private val versionUrl = "https://raw.githubusercontent.com/RillMaster/RaspberryController/main/version.txt"
-    private val apkUrl = "https://github.com/RillMaster/RaspberryController/releases/download/RaspbayriPi/app-debug.apk"
+    private val versionUrl   = "https://raw.githubusercontent.com/RillMaster/RaspberryController/main/version.txt"
+    // URL du fichier changelog (une ligne par nouveauté, ex: "- Correction bug terminal")
+    private val changelogUrl = "https://raw.githubusercontent.com/RillMaster/RaspberryController/main/changelog.txt"
+    private val apkUrl       = "https://github.com/RillMaster/RaspberryController/releases/download/RaspbayriPi/app-debug.apk"
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
 
-        easterEgg = EasterEggManager(this) {
-            startActivity(Intent(this, FakeCrashActivity::class.java))
-        }
-
         setContent {
-            val context   = LocalContext.current
-            val settings  = remember { SettingsManager(context) }
+            val context  = LocalContext.current
+            val settings = remember { SettingsManager(context) }
             var themePref by remember { mutableStateOf(settings.theme) }
 
             val darkTheme = when (themePref) {
@@ -71,10 +67,8 @@ class MainActivity : FragmentActivity() {
                         settings.theme = newTheme
                         themePref      = newTheme
                     },
-                    onAuthSuccess = {
-                        // ✅ On vérifie la mise à jour seulement après succès biométrique
-                        checkForUpdates()
-                    }
+                    // ✅ Appelé une seule fois quand MainApp est affiché (plus depuis le callback bio)
+                    onAppReady = { checkForUpdates() }
                 )
             }
         }
@@ -83,15 +77,19 @@ class MainActivity : FragmentActivity() {
     private fun checkForUpdates() {
         lifecycleScope.launch(Dispatchers.IO) {
             try {
-                // Récupère le code de version distant sur GitHub
-                val latestVersionCode = URL(versionUrl).readText().trim().toInt()
-                // Récupère le code de version actuel de l'application
+                val latestVersionCode  = URL(versionUrl).readText().trim().toInt()
                 val currentVersionCode = packageManager.getPackageInfo(packageName, 0).longVersionCode
 
-                // Si la version distante est supérieure, on propose la mise à jour
                 if (latestVersionCode > currentVersionCode) {
+                    // Récupère le changelog (optionnel, pas bloquant)
+                    val changelog = try {
+                        URL(changelogUrl).readText().trim()
+                    } catch (e: Exception) {
+                        ""
+                    }
+
                     withContext(Dispatchers.Main) {
-                        showUpdateDialog()
+                        showUpdateDialog(changelog)
                     }
                 }
             } catch (e: Exception) {
@@ -100,26 +98,24 @@ class MainActivity : FragmentActivity() {
         }
     }
 
-    private fun showUpdateDialog() {
+    private fun showUpdateDialog(changelog: String) {
+        val message = buildString {
+            append("Une nouvelle version de l'application est disponible.")
+            if (changelog.isNotEmpty()) {
+                append("\n\n📋 Nouveautés :\n")
+                append(changelog)
+            }
+            append("\n\nVoulez-vous l'installer ?")
+        }
+
         AlertDialog.Builder(this)
             .setTitle("Mise à jour disponible")
-            .setMessage("Une nouvelle version de l'application est disponible. Voulez-vous l'installer ?")
+            .setMessage(message)
             .setPositiveButton("Mettre à jour") { _, _ ->
-                val updateManager = UpdateManager(this)
-                updateManager.downloadAndInstall(apkUrl)
+                UpdateManager(this).downloadAndInstall(apkUrl)
             }
             .setNegativeButton("Plus tard", null)
             .show()
-    }
-
-    override fun onResume() {
-        super.onResume()
-        easterEgg.start()
-    }
-
-    override fun onPause() {
-        super.onPause()
-        easterEgg.stop()
     }
 }
 
@@ -128,7 +124,7 @@ fun AppEntryPoint(
     activity      : FragmentActivity,
     settings      : SettingsManager,
     onThemeChanged: (String) -> Unit,
-    onAuthSuccess : () -> Unit
+    onAppReady    : () -> Unit          // ✅ Renommé : déclenché à l'affichage de MainApp
 ) {
     var onboardingDone by remember { mutableStateOf(!settings.isFirstLaunch) }
 
@@ -148,10 +144,8 @@ fun AppEntryPoint(
         LaunchedEffect(Unit) {
             BiometricHelper.authenticate(
                 activity  = activity,
-                onSuccess = {
-                    isAuthenticated = true
-                    onAuthSuccess() // ✅ Signalement du succès pour la mise à jour
-                },
+                // ✅ Plus d'appel à onAppReady ici — juste l'état
+                onSuccess = { isAuthenticated = true },
                 onError   = { authError = it }
             )
         }
@@ -161,15 +155,16 @@ fun AppEntryPoint(
                 authError = null
                 BiometricHelper.authenticate(
                     activity  = activity,
-                    onSuccess = {
-                        isAuthenticated = true
-                        onAuthSuccess()
-                    },
+                    onSuccess = { isAuthenticated = true },
                     onError   = { authError = it }
                 )
             }
         )
     } else {
+        // ✅ La vérification MAJ est déclenchée UNE FOIS, seulement quand MainApp est affiché
+        LaunchedEffect(Unit) {
+            onAppReady()
+        }
         MainApp(
             activity           = activity,
             settings           = settings,
