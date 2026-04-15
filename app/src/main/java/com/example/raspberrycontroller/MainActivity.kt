@@ -1,5 +1,6 @@
 package com.example.raspberrycontroller
 
+import android.app.AlertDialog
 import android.content.Intent
 import android.os.Bundle
 import androidx.activity.compose.setContent
@@ -7,18 +8,12 @@ import androidx.activity.enableEdgeToEdge
 import androidx.biometric.BiometricManager
 import androidx.biometric.BiometricManager.Authenticators.BIOMETRIC_STRONG
 import androidx.biometric.BiometricManager.Authenticators.DEVICE_CREDENTIAL
-import androidx.compose.foundation.background
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.ArrowBack
-import androidx.compose.material.icons.filled.Delete
-import androidx.compose.material.icons.filled.DragHandle
-import androidx.compose.material.icons.filled.Settings
-import androidx.compose.material.icons.filled.Terminal
+import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -34,20 +29,25 @@ import androidx.compose.ui.unit.sp
 import androidx.fragment.app.FragmentActivity
 import androidx.lifecycle.lifecycleScope
 import com.example.raspberrycontroller.ui.theme.RaspberryControllerTheme
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import sh.calvin.reorderable.ReorderableItem
 import sh.calvin.reorderable.rememberReorderableLazyListState
+import java.net.URL
 
 class MainActivity : FragmentActivity() {
 
     private lateinit var easterEgg: EasterEggManager
+    // URL du fichier texte contenant uniquement le numéro de version (ex: 3)
+    private val versionUrl = "https://raw.githubusercontent.com/RillMaster/RaspberryController/main/version.txt"
+    private val apkUrl = "https://github.com/RillMaster/RaspberryController/releases/download/RaspbayriPi/app-debug.apk"
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
 
-        // ── Easter egg : shake → faux crash ────────────────────────────────
         easterEgg = EasterEggManager(this) {
             startActivity(Intent(this, FakeCrashActivity::class.java))
         }
@@ -70,10 +70,46 @@ class MainActivity : FragmentActivity() {
                     onThemeChanged = { newTheme ->
                         settings.theme = newTheme
                         themePref      = newTheme
+                    },
+                    onAuthSuccess = {
+                        // ✅ On vérifie la mise à jour seulement après succès biométrique
+                        checkForUpdates()
                     }
                 )
             }
         }
+    }
+
+    private fun checkForUpdates() {
+        lifecycleScope.launch(Dispatchers.IO) {
+            try {
+                // Récupère le code de version distant sur GitHub
+                val latestVersionCode = URL(versionUrl).readText().trim().toInt()
+                // Récupère le code de version actuel de l'application
+                val currentVersionCode = packageManager.getPackageInfo(packageName, 0).longVersionCode
+
+                // Si la version distante est supérieure, on propose la mise à jour
+                if (latestVersionCode > currentVersionCode) {
+                    withContext(Dispatchers.Main) {
+                        showUpdateDialog()
+                    }
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
+    }
+
+    private fun showUpdateDialog() {
+        AlertDialog.Builder(this)
+            .setTitle("Mise à jour disponible")
+            .setMessage("Une nouvelle version de l'application est disponible. Voulez-vous l'installer ?")
+            .setPositiveButton("Mettre à jour") { _, _ ->
+                val updateManager = UpdateManager(this)
+                updateManager.downloadAndInstall(apkUrl)
+            }
+            .setNegativeButton("Plus tard", null)
+            .show()
     }
 
     override fun onResume() {
@@ -87,14 +123,12 @@ class MainActivity : FragmentActivity() {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Point d'entrée : onboarding → biométrie → app
-// ─────────────────────────────────────────────────────────────────────────────
 @Composable
 fun AppEntryPoint(
     activity      : FragmentActivity,
     settings      : SettingsManager,
-    onThemeChanged: (String) -> Unit
+    onThemeChanged: (String) -> Unit,
+    onAuthSuccess : () -> Unit
 ) {
     var onboardingDone by remember { mutableStateOf(!settings.isFirstLaunch) }
 
@@ -114,7 +148,10 @@ fun AppEntryPoint(
         LaunchedEffect(Unit) {
             BiometricHelper.authenticate(
                 activity  = activity,
-                onSuccess = { isAuthenticated = true },
+                onSuccess = {
+                    isAuthenticated = true
+                    onAuthSuccess() // ✅ Signalement du succès pour la mise à jour
+                },
                 onError   = { authError = it }
             )
         }
@@ -124,7 +161,10 @@ fun AppEntryPoint(
                 authError = null
                 BiometricHelper.authenticate(
                     activity  = activity,
-                    onSuccess = { isAuthenticated = true },
+                    onSuccess = {
+                        isAuthenticated = true
+                        onAuthSuccess()
+                    },
                     onError   = { authError = it }
                 )
             }
