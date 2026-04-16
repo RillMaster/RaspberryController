@@ -1,0 +1,3 @@
+- Fixed the timing of the update popup
+- Removed the Easter egg
+- Added a description of the new features to the update dialog
