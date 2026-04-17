@@ -1,3 +1,5 @@
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
@@ -6,14 +8,14 @@ plugins {
 
 android {
     namespace = "com.example.raspberrycontroller"
-    compileSdk = 35
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.example.raspberrycontroller"
         minSdk = 26
-        targetSdk = 35
-        versionCode = 4
-        versionName = "1.1.6"
+        targetSdk = 36
+        versionCode = 5
+        versionName = "1.2.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -31,11 +33,14 @@ android {
         sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11
     }
-    kotlinOptions {
-        jvmTarget = "11"
-    }
     buildFeatures {
         compose = true
+    }
+}
+
+kotlin {
+    compilerOptions {
+        jvmTarget = JvmTarget.JVM_11
     }
 }
 
@@ -56,14 +61,10 @@ dependencies {
     androidTestImplementation(libs.androidx.ui.test.junit4)
     debugImplementation(libs.androidx.ui.tooling)
     debugImplementation(libs.androidx.ui.test.manifest)
-    implementation("sh.calvin.reorderable:reorderable:2.4.0")
-
-    // Retrofit
-    implementation("com.squareup.retrofit2:retrofit:2.9.0")
-    implementation("com.squareup.retrofit2:converter-gson:2.9.0")
-    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
-
-    // SSH direct (JSch)
-    implementation("com.github.mwiede:jsch:0.2.17")
-    implementation("androidx.biometric:biometric:1.2.0-alpha05")
+    implementation(libs.calvin.reorderable)
+    implementation(libs.squareup.retrofit)
+    implementation(libs.squareup.retrofit.gson)
+    implementation(libs.kotlinx.coroutines.android)
+    implementation(libs.mwiede.jsch)
+    implementation(libs.androidx.biometric)
 }

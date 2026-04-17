@@ -1,4 +1,4 @@
-- Fixed the timing of the update popup
-- Removed the Easter egg
-- Added a description of the new features to the update dialog
-- automatic update correction
+- Fixed terminal lag
+- Added CPU and RAM stats
+- Added color to terminal shortcuts
+

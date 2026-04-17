@@ -2,6 +2,7 @@ package com.example.raspberrycontroller
 
 import android.app.Activity
 import android.content.Context
+import android.content.ClipboardManager
 import android.content.pm.ActivityInfo
 import android.view.inputmethod.InputMethodManager
 import androidx.compose.foundation.background
@@ -28,7 +29,9 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.*
 import androidx.compose.ui.text.font.FontFamily
@@ -66,6 +69,23 @@ private fun ansi256(n: Int): Color = when {
     }
     else -> (8 + (n - 232) * 10).let { Color(it, it, it) }
 }
+
+// ── Palette de couleurs pour les raccourcis ───────────────────────────────────
+private val SHORTCUT_COLORS = listOf(
+    Color(0xFF39FF14),
+    Color(0xFF00BFFF),
+    Color(0xFFFF6B6B),
+    Color(0xFFFFD93D),
+    Color(0xFFFF8C42),
+    Color(0xFFB388FF),
+    Color(0xFF4DD0E1),
+    Color(0xFFFF80AB),
+    Color(0xFF69F0AE),
+    Color(0xFFFFAB40),
+)
+
+private fun shortcutColor(index: Int): Color =
+    SHORTCUT_COLORS[index % SHORTCUT_COLORS.size]
 
 // ══════════════════════════════════════════════════════════════════════════════
 //  Émulateur VT100 / xterm-256color
@@ -356,13 +376,20 @@ private val EDITOR_CMD_REGEX = Regex(
 )
 
 // ══════════════════════════════════════════════════════════════════════════════
+//  Constantes de connexion
+// ══════════════════════════════════════════════════════════════════════════════
+private const val KEEP_ALIVE_INTERVAL_MS = 30_000L
+private const val RECONNECT_DELAY_MS     = 3_000L
+private const val MAX_RECONNECT_ATTEMPTS = 10
+
+// ══════════════════════════════════════════════════════════════════════════════
 //  État de l'éditeur intégré
 // ══════════════════════════════════════════════════════════════════════════════
 private data class EditorState(
     val filePath      : String,
-    val initialContent: String = "",
+    val initialContent: String  = "",
     val isLoading     : Boolean = true,
-    val sessionId     : Long = System.currentTimeMillis()
+    val sessionId     : Long    = System.currentTimeMillis()
 )
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -381,9 +408,7 @@ fun TerminalScreen(settings: SettingsManager, onClose: () -> Unit) {
     fun forceShowKeyboard() {
         focusRequester.requestFocus()
         val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
-        view.post {
-            imm.showSoftInput(view, InputMethodManager.SHOW_IMPLICIT)
-        }
+        imm.showSoftInput(view, InputMethodManager.SHOW_IMPLICIT)
     }
 
     var rawInput    by remember { mutableStateOf(TextFieldValue(ghost)) }
@@ -391,33 +416,33 @@ fun TerminalScreen(settings: SettingsManager, onClose: () -> Unit) {
     var status      by remember { mutableStateOf("Connexion...") }
     var isConnected by remember { mutableStateOf(false) }
 
+    var userClosedManually by remember { mutableStateOf(false) }
+    var reconnectAttempt   by remember { mutableIntStateOf(0) }
+    var isReconnecting     by remember { mutableStateOf(false) }
+
     var ctrlActive  by remember { mutableStateOf(false) }
     var altActive   by remember { mutableStateOf(false) }
     var isLandscape by remember { mutableStateOf(false) }
     var showBars    by remember { mutableStateOf(true) }
     var fontSize    by remember { mutableFloatStateOf(13f) }
 
-    val emulator      = remember { TerminalEmulator(80, 24) }
-    var renderTick    by remember { mutableIntStateOf(0) }
+    val emulator   = remember { TerminalEmulator(80, 24) }
+    var renderTick by remember { mutableIntStateOf(0) }
+    var termCols   by remember { mutableIntStateOf(80) }
+    var termRows   by remember { mutableIntStateOf(24) }
+
     var cursorVisible by remember { mutableStateOf(true) }
-    var termCols      by remember { mutableIntStateOf(80) }
-    var termRows      by remember { mutableIntStateOf(24) }
-
-    // ── État éditeur intégré ──────────────────────────────────────────────────
-    var editorState by remember { mutableStateOf<EditorState?>(null) }
-    var typedLine   by remember { mutableStateOf("") }
-
     LaunchedEffect(Unit) { while (true) { delay(530); cursorVisible = !cursorVisible } }
 
-    val screenLines        = remember(renderTick, cursorVisible) {
-        emulator.toScreenLines(showCursor = cursorVisible && isConnected)
-    }
+    val screenLines        = remember(renderTick) { emulator.toScreenLines(showCursor = false) }
+    val cursorRow          = emulator.cursorRow
+    val cursorCol          = emulator.cursorCol
     val scrollbackSnapshot = remember(renderTick) { emulator.scrollback.toList() }
     val totalLines         = scrollbackSnapshot.size + screenLines.size
     val listState          = rememberLazyListState()
 
-    LaunchedEffect(renderTick) {
-        if (totalLines > 0) try { listState.animateScrollToItem(totalLines - 1) } catch (_: Exception) {}
+    LaunchedEffect(totalLines) {
+        if (totalLines > 0) try { listState.scrollToItem(totalLines - 1) } catch (_: Exception) {}
     }
 
     LaunchedEffect(termCols, termRows) {
@@ -425,30 +450,40 @@ fun TerminalScreen(settings: SettingsManager, onClose: () -> Unit) {
         renderTick++
     }
 
-    val shortcuts = remember { settings.shortcuts }
+    var editorState by remember { mutableStateOf<EditorState?>(null) }
+    var typedLine   by remember { mutableStateOf("") }
+    val shortcuts   = remember { settings.shortcuts }
 
     fun toggleRotation() {
         val a = context as? Activity ?: return
         isLandscape = !isLandscape
         a.requestedOrientation = if (isLandscape) ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
-        else             ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+        else ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
     }
     DisposableEffect(Unit) {
         onDispose { (context as? Activity)?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED }
     }
 
-    // ── sendRaw avec interception éditeur ─────────────────────────────────────
+    fun pasteFromClipboard() {
+        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        val text = clipboard.primaryClip?.getItemAt(0)?.coerceToText(context)?.toString() ?: return
+        if (text.isNotEmpty()) {
+            typedLine += text
+            scope.launch { session?.sendRaw(text) }
+        }
+    }
+
     fun sendRaw(bytes: String) {
         when {
             bytes == "\r" -> {
-                val cmd = typedLine.trim()
+                val cmd   = typedLine.trim()
                 typedLine = ""
                 val match = EDITOR_CMD_REGEX.find(cmd)
                 if (match != null && isConnected) {
-                    val rawPath = match.groupValues[1].trim()
+                    val rawPath  = match.groupValues[1].trim()
                     scope.launch { session?.sendRaw("\u0015") }
                     val openedAt = System.currentTimeMillis()
-                    editorState = EditorState(filePath = rawPath, isLoading = true, sessionId = openedAt)
+                    editorState  = EditorState(filePath = rawPath, isLoading = true, sessionId = openedAt)
                     scope.launch {
                         val content = RemoteFileHelper.readFile(settings, rawPath)
                         editorState = EditorState(
@@ -481,22 +516,32 @@ fun TerminalScreen(settings: SettingsManager, onClose: () -> Unit) {
         }
     }
 
-    // ── CORRECTION : sendCommand envoie directement sans passer par typedLine ─
     fun sendCommand(cmd: String) {
         if (cmd.isBlank() || !isConnected) return
         scope.launch { session?.sendRaw("$cmd\r") }
     }
 
-    // Connexion SSH
-    LaunchedEffect(Unit) {
-        emulator.process("Connexion à ${settings.host}:${settings.port}...\r\n")
-        renderTick++
+    suspend fun connectSsh() {
         val result = SshClient.openShell(
-            host = settings.host, port = settings.port,
-            user = settings.username, password = settings.password
+            host     = settings.host,
+            port     = settings.port,
+            user     = settings.username,
+            password = settings.password
         )
         result.onSuccess { sh ->
-            session = sh; status = "Connecté"; isConnected = true
+            session          = sh
+            status           = "Connecté"
+            isConnected      = true
+            isReconnecting   = false
+            reconnectAttempt = 0
+
+            scope.launch(Dispatchers.IO) {
+                while (sh.isConnected) {
+                    delay(KEEP_ALIVE_INTERVAL_MS)
+                    try { sh.sendRaw("\u0000") } catch (_: Exception) { break }
+                }
+            }
+
             scope.launch(Dispatchers.IO) {
                 val reader = sh.inputStream.bufferedReader(Charsets.UTF_8)
                 val buffer = CharArray(4096)
@@ -506,20 +551,74 @@ fun TerminalScreen(settings: SettingsManager, onClose: () -> Unit) {
                     val text = String(buffer, 0, n)
                     withContext(Dispatchers.Main) { emulator.process(text); renderTick++ }
                 }
-                withContext(Dispatchers.Main) { status = "Déconnecté"; isConnected = false; onClose() }
+
+                withContext(Dispatchers.Main) {
+                    isConnected = false
+                    session     = null
+
+                    if (!userClosedManually) {
+                        if (reconnectAttempt < MAX_RECONNECT_ATTEMPTS) {
+                            reconnectAttempt++
+                            isReconnecting = true
+                            status = "Reconnexion ($reconnectAttempt/$MAX_RECONNECT_ATTEMPTS)..."
+                            emulator.process("\r\n\u001B[33m⚠ Connexion perdue — tentative $reconnectAttempt/$MAX_RECONNECT_ATTEMPTS dans ${RECONNECT_DELAY_MS / 1000} s...\u001B[0m\r\n")
+                            renderTick++
+                            scope.launch {
+                                delay(RECONNECT_DELAY_MS)
+                                if (!userClosedManually) connectSsh()
+                            }
+                        } else {
+                            isReconnecting = false
+                            status = "Déconnecté"
+                            emulator.process("\r\n\u001B[31m✗ Reconnexion abandonnée après $MAX_RECONNECT_ATTEMPTS tentatives.\u001B[0m\r\n")
+                            renderTick++
+                        }
+                    } else {
+                        status = "Déconnecté"
+                        onClose()
+                    }
+                }
             }
         }.onFailure { err ->
-            emulator.process(SshClient.parseError(err) + "\r\n")
-            emulator.process("Vérifiez les paramètres SSH.\r\n")
-            renderTick++; status = "Erreur"; isConnected = false
+            isConnected = false
+            session     = null
+
+            if (!userClosedManually && reconnectAttempt < MAX_RECONNECT_ATTEMPTS) {
+                reconnectAttempt++
+                isReconnecting = true
+                status = "Reconnexion ($reconnectAttempt/$MAX_RECONNECT_ATTEMPTS)..."
+                emulator.process("\r\n\u001B[33m⚠ Échec — ${SshClient.parseError(err)}\u001B[0m\r\n")
+                emulator.process("\u001B[33m  Nouvelle tentative dans ${RECONNECT_DELAY_MS / 1000} s...\u001B[0m\r\n")
+                renderTick++
+                delay(RECONNECT_DELAY_MS)
+                if (!userClosedManually) connectSsh()
+            } else if (!userClosedManually) {
+                isReconnecting = false
+                status = "Erreur"
+                emulator.process(SshClient.parseError(err) + "\r\n")
+                emulator.process("Vérifiez les paramètres SSH.\r\n")
+                renderTick++
+            }
         }
     }
 
-    LaunchedEffect(Unit)   { delay(300); forceShowKeyboard() }
-    DisposableEffect(Unit) { onDispose { session?.close() } }
+    LaunchedEffect(Unit) {
+        emulator.process("Connexion à ${settings.host}:${settings.port}...\r\n")
+        renderTick++
+        connectSsh()
+    }
+
+    LaunchedEffect(Unit) { forceShowKeyboard() }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            userClosedManually = true
+            session?.close()
+        }
+    }
 
     // ══════════════════════════════════════════════════════════════════════════
-    //  Affichage : éditeur ou terminal
+    //  Affichage
     // ══════════════════════════════════════════════════════════════════════════
     val currentEditorState = editorState
     if (currentEditorState != null) {
@@ -531,26 +630,41 @@ fun TerminalScreen(settings: SettingsManager, onClose: () -> Unit) {
                 onSave         = { content ->
                     RemoteFileHelper.writeFile(settings, currentEditorState.filePath, content)
                 },
-                onClose        = {
+                onClose = {
                     editorState = null
-                    scope.launch { delay(100); forceShowKeyboard() }
+                    scope.launch { forceShowKeyboard() }
                 }
             )
         }
     } else {
-        // ── Terminal ──────────────────────────────────────────────────────────
         Scaffold(
             topBar = {
                 TopAppBar(
                     title = {
                         Column {
                             Text("Terminal SSH", fontFamily = FontFamily.Monospace)
-                            Text(status, style = MaterialTheme.typography.labelSmall,
-                                color = when {
-                                    isConnected              -> TerminalGreen
-                                    status == "Connexion..." -> Color.Yellow
-                                    else                     -> Color.Red
-                                })
+                            Row(
+                                verticalAlignment     = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(4.dp)
+                            ) {
+                                if (isReconnecting) {
+                                    CircularProgressIndicator(
+                                        modifier    = Modifier.size(8.dp),
+                                        strokeWidth = 1.5.dp,
+                                        color       = Color.Yellow
+                                    )
+                                }
+                                Text(
+                                    text  = status,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = when {
+                                        isConnected                        -> TerminalGreen
+                                        isReconnecting                     -> Color.Yellow
+                                        status.startsWith("Connexion")     -> Color.Yellow
+                                        else                               -> Color.Red
+                                    }
+                                )
+                            }
                         }
                     },
                     actions = {
@@ -560,19 +674,54 @@ fun TerminalScreen(settings: SettingsManager, onClose: () -> Unit) {
                         IconButton(onClick = { if (fontSize < 22f) fontSize += 1f }) {
                             Text("A+", color = TerminalGreen.copy(0.75f), fontSize = 12.sp, fontFamily = FontFamily.Monospace)
                         }
+                        IconButton(
+                            onClick = { if (isConnected) pasteFromClipboard() },
+                            enabled = isConnected
+                        ) {
+                            Icon(
+                                Icons.Default.ContentPaste,
+                                contentDescription = "Coller",
+                                tint = if (isConnected) TerminalGreen.copy(0.75f) else Color(0xFF3A3A3A)
+                            )
+                        }
+                        if (!isConnected && !isReconnecting) {
+                            IconButton(onClick = {
+                                reconnectAttempt   = 0
+                                userClosedManually = false
+                                status             = "Reconnexion..."
+                                isReconnecting     = true
+                                emulator.process("\r\n\u001B[33m↺ Reconnexion manuelle...\u001B[0m\r\n")
+                                renderTick++
+                                scope.launch { connectSsh() }
+                            }) {
+                                Icon(
+                                    Icons.Default.Refresh,
+                                    contentDescription = "Reconnecter",
+                                    tint = Color.Yellow
+                                )
+                            }
+                        }
                         if (isLandscape) {
                             IconButton(onClick = { showBars = !showBars }) {
                                 Icon(
                                     if (showBars) Icons.Default.KeyboardArrowDown else Icons.Default.KeyboardArrowUp,
-                                    contentDescription = "Barres", tint = TerminalGreen.copy(0.75f)
+                                    contentDescription = "Barres",
+                                    tint = TerminalGreen.copy(0.75f)
                                 )
                             }
                         }
                         IconButton(onClick = { toggleRotation() }) {
-                            Icon(Icons.Default.ScreenRotation, contentDescription = "Rotation",
-                                tint = if (isLandscape) TerminalGreen else TerminalGreen.copy(0.45f))
+                            Icon(
+                                Icons.Default.ScreenRotation,
+                                contentDescription = "Rotation",
+                                tint = if (isLandscape) TerminalGreen else TerminalGreen.copy(0.45f)
+                            )
                         }
-                        IconButton(onClick = { session?.close(); onClose() }) {
+                        IconButton(onClick = {
+                            userClosedManually = true
+                            session?.close()
+                            onClose()
+                        }) {
                             Icon(Icons.Default.Close, contentDescription = "Fermer", tint = TerminalGreen)
                         }
                     },
@@ -588,6 +737,33 @@ fun TerminalScreen(settings: SettingsManager, onClose: () -> Unit) {
                     .background(TerminalBg)
                     .imePadding()
             ) {
+                // ── Bannière de reconnexion ────────────────────────────────────
+                if (isReconnecting) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(Color(0xFF2A1F00))
+                            .padding(horizontal = 12.dp, vertical = 4.dp)
+                    ) {
+                        Row(
+                            verticalAlignment     = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            CircularProgressIndicator(
+                                modifier    = Modifier.size(12.dp),
+                                strokeWidth = 2.dp,
+                                color       = Color(0xFFFFD93D)
+                            )
+                            Text(
+                                text       = status,
+                                color      = Color(0xFFFFD93D),
+                                fontSize   = 11.sp,
+                                fontFamily = FontFamily.Monospace
+                            )
+                        }
+                    }
+                }
+
                 // ── Zone terminal ─────────────────────────────────────────────
                 Box(
                     modifier = Modifier
@@ -595,97 +771,141 @@ fun TerminalScreen(settings: SettingsManager, onClose: () -> Unit) {
                         .fillMaxWidth()
                         .background(TerminalBg)
                 ) {
-                    BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
-                        val boxW    = maxWidth.value
-                        val boxH    = maxHeight.value
-                        val charW   = fontSize * 0.6f
-                        val charH   = fontSize * 1.27f
-                        val newCols = (boxW / charW).toInt().coerceIn(20, 250)
-                        val newRows = (boxH / charH).toInt().coerceIn(5, 80)
-                        LaunchedEffect(newCols, newRows) { termCols = newCols; termRows = newRows }
-                    }
+                    // LocalDensity doit être capturé dans la composition,
+                    // avant d'être utilisé dans le callback onSizeChanged.
+                    val density = LocalDensity.current
 
-                    val hScroll = rememberScrollState()
-
-                    BasicTextField(
-                        value         = rawInput,
-                        onValueChange = { nv ->
-                            val old = rawInput.text
-                            val new = nv.text
-                            when {
-                                new.length > old.length -> {
-                                    val added = new.replace(ghost, "")
-                                    if (added.isNotEmpty()) {
-                                        when {
-                                            ctrlActive -> {
-                                                val ch   = added.last().lowercaseChar()
-                                                val code = ch.code - 'a'.code + 1
-                                                sendRaw(if (code in 1..26) code.toChar().toString() else ch.toString())
-                                                ctrlActive = false
-                                            }
-                                            altActive -> {
-                                                sendRaw("\u001B${added.last()}")
-                                                altActive = false
-                                            }
-                                            else -> sendRaw(added)
-                                        }
-                                    }
-                                    rawInput = TextFieldValue(ghost, selection = TextRange(ghost.length))
-                                }
-                                new.length < old.length -> {
-                                    val count = (old.length - new.length).coerceAtLeast(1)
-                                    repeat(count) { sendRaw("\u0008") }
-                                    rawInput = TextFieldValue(ghost, selection = TextRange(ghost.length))
-                                }
-                            }
-                        },
-                        textStyle       = TextStyle(color = Color.Transparent, fontSize = 1.sp),
-                        cursorBrush     = SolidColor(Color.Transparent),
-                        modifier        = Modifier
-                            .size(1.dp)
-                            .align(Alignment.BottomStart)
-                            .alpha(0f)
-                            .focusRequester(focusRequester),
-                        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
-                        keyboardActions = KeyboardActions(onSend = {
-                            sendRaw("\r")
-                            rawInput = TextFieldValue(ghost, selection = TextRange(ghost.length))
-                        }),
-                        singleLine = true
-                    )
-
-                    SelectionContainer(
+                    Box(
                         modifier = Modifier
                             .fillMaxSize()
-                            .pointerInput(Unit) {
-                                awaitPointerEventScope {
-                                    while (true) {
-                                        val event = awaitPointerEvent()
-                                        val isUp = event.changes.all { !it.pressed }
-                                        val isLongPress = event.changes.any {
-                                            it.uptimeMillis - it.previousUptimeMillis > 400
+                            .onSizeChanged { size ->
+                                val charW   = fontSize * 0.6f
+                                val charH   = fontSize * 1.27f
+                                val boxW    = size.width / density.density
+                                val boxH    = size.height / density.density
+                                val newCols = (boxW / charW).toInt().coerceIn(20, 250)
+                                val newRows = (boxH / charH).toInt().coerceIn(5, 80)
+                                termCols    = newCols
+                                termRows    = newRows
+                            }
+                    ) {
+                        BasicTextField(
+                            value         = rawInput,
+                            onValueChange = { nv ->
+                                val old = rawInput.text
+                                val new = nv.text
+                                when {
+                                    new.length > old.length -> {
+                                        val added = new.replace(ghost, "")
+                                        if (added.isNotEmpty()) {
+                                            when {
+                                                ctrlActive -> {
+                                                    val ch   = added.last().lowercaseChar()
+                                                    val code = ch.code - 'a'.code + 1
+                                                    sendRaw(if (code in 1..26) code.toChar().toString() else ch.toString())
+                                                    ctrlActive = false
+                                                }
+                                                altActive -> {
+                                                    sendRaw("\u001B${added.last()}")
+                                                    altActive = false
+                                                }
+                                                added.length > 1 -> {
+                                                    typedLine += added
+                                                    scope.launch { session?.sendRaw(added) }
+                                                }
+                                                else -> sendRaw(added)
+                                            }
                                         }
-                                        if (isUp && !isLongPress) {
-                                            forceShowKeyboard()
+                                        rawInput = TextFieldValue(ghost, selection = TextRange(ghost.length))
+                                    }
+                                    new.length < old.length -> {
+                                        val count = (old.length - new.length).coerceAtLeast(1)
+                                        repeat(count) { sendRaw("\u0008") }
+                                        rawInput = TextFieldValue(ghost, selection = TextRange(ghost.length))
+                                    }
+                                }
+                            },
+                            textStyle       = TextStyle(color = Color.Transparent, fontSize = 1.sp),
+                            cursorBrush     = SolidColor(Color.Transparent),
+                            modifier        = Modifier
+                                .size(1.dp)
+                                .align(Alignment.BottomStart)
+                                .alpha(0f)
+                                .focusRequester(focusRequester),
+                            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
+                            keyboardActions = KeyboardActions(onSend = {
+                                sendRaw("\r")
+                                rawInput = TextFieldValue(ghost, selection = TextRange(ghost.length))
+                            }),
+                            singleLine = false
+                        )
+
+                        val hScroll = rememberScrollState()
+                        SelectionContainer(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .pointerInput(Unit) {
+                                    awaitPointerEventScope {
+                                        while (true) {
+                                            val event       = awaitPointerEvent()
+                                            val isUp        = event.changes.all { !it.pressed }
+                                            val isLongPress = event.changes.any {
+                                                it.uptimeMillis - it.previousUptimeMillis > 400
+                                            }
+                                            if (isUp && !isLongPress) forceShowKeyboard()
                                         }
                                     }
                                 }
-                            }
-                    ) {
-                        LazyColumn(
-                            state    = listState,
-                            modifier = Modifier
-                                .fillMaxSize()
-                                .horizontalScroll(hScroll)
-                                .padding(horizontal = 4.dp, vertical = 2.dp)
                         ) {
-                            items(scrollbackSnapshot) { line ->
-                                Text(line, fontFamily = FontFamily.Monospace,
-                                    fontSize = fontSize.sp, lineHeight = (fontSize * 1.27f).sp, softWrap = false)
-                            }
-                            items(screenLines) { line ->
-                                Text(line, fontFamily = FontFamily.Monospace,
-                                    fontSize = fontSize.sp, lineHeight = (fontSize * 1.27f).sp, softWrap = false)
+                            LazyColumn(
+                                state    = listState,
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .horizontalScroll(hScroll)
+                                    .padding(horizontal = 4.dp, vertical = 2.dp)
+                            ) {
+                                items(scrollbackSnapshot) { line ->
+                                    Text(
+                                        line,
+                                        fontFamily = FontFamily.Monospace,
+                                        fontSize   = fontSize.sp,
+                                        lineHeight = (fontSize * 1.27f).sp,
+                                        softWrap   = false
+                                    )
+                                }
+                                screenLines.forEachIndexed { idx, line ->
+                                    item(key = "sr_$idx") {
+                                        if (isConnected && idx == cursorRow) {
+                                            val withCursor = remember(line, cursorCol, cursorVisible) {
+                                                if (!cursorVisible) line
+                                                else buildAnnotatedString {
+                                                    line.spanStyles.forEach { addStyle(it.item, it.start, it.end) }
+                                                    append(line.text)
+                                                    val ci = cursorCol.coerceAtMost(line.length)
+                                                    addStyle(
+                                                        SpanStyle(color = TerminalBg, background = TERM_DEFAULT_FG),
+                                                        ci, (ci + 1).coerceAtMost(line.length)
+                                                    )
+                                                }
+                                            }
+                                            Text(
+                                                withCursor,
+                                                fontFamily = FontFamily.Monospace,
+                                                fontSize   = fontSize.sp,
+                                                lineHeight = (fontSize * 1.27f).sp,
+                                                softWrap   = false
+                                            )
+                                        } else {
+                                            Text(
+                                                line,
+                                                fontFamily = FontFamily.Monospace,
+                                                fontSize   = fontSize.sp,
+                                                lineHeight = (fontSize * 1.27f).sp,
+                                                softWrap   = false
+                                            )
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -719,6 +939,8 @@ fun TerminalScreen(settings: SettingsManager, onClose: () -> Unit) {
                                 .background(Color(0xFF333333))
                         )
 
+                        CompactKey(label = "Paste", enabled = isConnected) { pasteFromClipboard() }
+
                         SPECIAL_KEYS.forEach { (label, bytes) ->
                             CompactKey(label = label, enabled = isConnected) { sendRaw(bytes) }
                         }
@@ -729,20 +951,19 @@ fun TerminalScreen(settings: SettingsManager, onClose: () -> Unit) {
                         LazyRow(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .background(Color(0xFF0E0E0E))
-                                .padding(horizontal = 6.dp, vertical = 3.dp),
-                            horizontalArrangement = Arrangement.spacedBy(5.dp),
+                                .background(Color(0xFF0A0A0A))
+                                .padding(horizontal = 6.dp, vertical = 4.dp),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
                             verticalAlignment     = Alignment.CenterVertically
                         ) {
-                            items(shortcuts) { (label, cmd) ->
-                                SuggestionChip(
-                                    onClick  = { if (isConnected) sendCommand(cmd) },
-                                    label    = { Text(label, fontFamily = FontFamily.Monospace, fontSize = 10.sp) },
-                                    colors   = SuggestionChipDefaults.suggestionChipColors(
-                                        containerColor = Color(0xFF1A2A1A), labelColor = TerminalGreen),
-                                    border   = SuggestionChipDefaults.suggestionChipBorder(
-                                        enabled = true, borderColor = TerminalGreen.copy(0.3f)),
-                                    modifier = Modifier.height(24.dp)
+                            items(shortcuts.size) { idx ->
+                                val (label, cmd) = shortcuts[idx]
+                                val color        = shortcutColor(idx)
+                                ShortcutChip(
+                                    label   = label,
+                                    color   = color,
+                                    enabled = isConnected,
+                                    onClick = { sendCommand(cmd) }
                                 )
                             }
                         }
@@ -768,6 +989,52 @@ fun TerminalScreen(settings: SettingsManager, onClose: () -> Unit) {
             }
         }
     }
+}
+
+// ── Chip de raccourci coloré ──────────────────────────────────────────────────
+@Composable
+private fun ShortcutChip(
+    label  : String,
+    color  : Color,
+    enabled: Boolean,
+    onClick: () -> Unit
+) {
+    val bgColor     = color.copy(alpha = 0.10f)
+    val borderColor = color.copy(alpha = if (enabled) 0.55f else 0.20f)
+    val textColor   = color.copy(alpha = if (enabled) 1.00f else 0.35f)
+
+    SuggestionChip(
+        onClick = { if (enabled) onClick() },
+        label   = {
+            Row(
+                verticalAlignment     = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(6.dp)
+                        .background(
+                            color = color.copy(alpha = if (enabled) 0.9f else 0.3f),
+                            shape = androidx.compose.foundation.shape.CircleShape
+                        )
+                )
+                Text(
+                    text       = label,
+                    fontFamily = FontFamily.Monospace,
+                    fontSize   = 10.sp,
+                    color      = textColor
+                )
+            }
+        },
+        colors  = SuggestionChipDefaults.suggestionChipColors(
+            containerColor = bgColor
+        ),
+        border  = SuggestionChipDefaults.suggestionChipBorder(
+            enabled     = true,
+            borderColor = borderColor
+        ),
+        modifier = Modifier.height(26.dp)
+    )
 }
 
 // ── Touche compacte ───────────────────────────────────────────────────────────
