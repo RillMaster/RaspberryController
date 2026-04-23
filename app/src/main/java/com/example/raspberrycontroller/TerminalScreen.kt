@@ -6,6 +6,7 @@ import android.content.ClipboardManager
 import android.content.pm.ActivityInfo
 import android.view.inputmethod.InputMethodManager
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -13,6 +14,7 @@ import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
@@ -72,20 +74,100 @@ private fun ansi256(n: Int): Color = when {
 
 // ── Palette de couleurs pour les raccourcis ───────────────────────────────────
 private val SHORTCUT_COLORS = listOf(
-    Color(0xFF39FF14),
-    Color(0xFF00BFFF),
-    Color(0xFFFF6B6B),
-    Color(0xFFFFD93D),
-    Color(0xFFFF8C42),
-    Color(0xFFB388FF),
-    Color(0xFF4DD0E1),
-    Color(0xFFFF80AB),
-    Color(0xFF69F0AE),
-    Color(0xFFFFAB40),
+    Color(0xFF39FF14), Color(0xFF00BFFF), Color(0xFFFF6B6B), Color(0xFFFFD93D),
+    Color(0xFFFF8C42), Color(0xFFB388FF), Color(0xFF4DD0E1), Color(0xFFFF80AB),
+    Color(0xFF69F0AE), Color(0xFFFFAB40),
+)
+private fun shortcutColor(index: Int): Color = SHORTCUT_COLORS[index % SHORTCUT_COLORS.size]
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  Coloration syntaxique de l'output
+// ══════════════════════════════════════════════════════════════════════════════
+private val ERROR_REGEX   = Regex("""(?i)\b(error|fail|failed|failure|denied|fatal|not found|permission denied|command not found|no such file|traceback|exception|critical)\b""")
+private val SUCCESS_REGEX = Regex("""(?i)\b(success|succeeded|ok|done|complete|completed|saved|installed|started|active|running|enabled)\b""")
+private val WARNING_REGEX = Regex("""(?i)\b(warn|warning|deprecated|caution|notice)\b""")
+
+private val OUTPUT_ERROR_COLOR   = Color(0xFFFF5555)
+private val OUTPUT_SUCCESS_COLOR = Color(0xFF50FA7B)
+private val OUTPUT_WARNING_COLOR = Color(0xFFFFD93D)
+
+/** Retourne une couleur de teinte si la ligne brute correspond à un pattern, sinon null */
+fun syntaxTintForLine(rawText: String): Color? = when {
+    ERROR_REGEX.containsMatchIn(rawText)   -> OUTPUT_ERROR_COLOR
+    SUCCESS_REGEX.containsMatchIn(rawText) -> OUTPUT_SUCCESS_COLOR
+    WARNING_REGEX.containsMatchIn(rawText) -> OUTPUT_WARNING_COLOR
+    else                                   -> null
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  Historique des commandes
+// ══════════════════════════════════════════════════════════════════════════════
+class CommandHistory(private val maxSize: Int = 100) {
+    private val _entries = mutableListOf<String>()
+    val entries: List<String> get() = _entries.toList()
+
+    private var browseIndex = -1  // -1 = position courante (pas en navigation)
+
+    fun add(cmd: String) {
+        val trimmed = cmd.trim()
+        if (trimmed.isBlank()) return
+        _entries.remove(trimmed)          // déduplique
+        _entries.add(0, trimmed)          // plus récent en tête
+        if (_entries.size > maxSize) _entries.removeAt(_entries.size - 1)
+        browseIndex = -1
+    }
+
+    fun reset() { browseIndex = -1 }
+
+    /** Remonte dans l'historique (touche ↑). Retourne la commande ou null. */
+    fun goUp(): String? {
+        if (_entries.isEmpty()) return null
+        browseIndex = (browseIndex + 1).coerceAtMost(_entries.size - 1)
+        return _entries[browseIndex]
+    }
+
+    /** Descend dans l'historique (touche ↓). Retourne la commande, ou chaîne vide si retour au présent. */
+    fun goDown(): String {
+        if (browseIndex <= 0) { browseIndex = -1; return "" }
+        browseIndex--
+        return _entries[browseIndex]
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  Autocomplétion
+// ══════════════════════════════════════════════════════════════════════════════
+private val COMMON_COMMANDS = listOf(
+    "ls", "ls -la", "ls -lh", "cd", "cd ..", "cd ~", "pwd",
+    "cat", "nano", "vi", "vim", "less", "more", "tail -f", "tail -n",
+    "grep", "grep -r", "grep -i", "find", "find . -name",
+    "sudo", "sudo apt update", "sudo apt upgrade", "sudo apt install",
+    "apt list --installed", "dpkg -l",
+    "systemctl status", "systemctl start", "systemctl stop", "systemctl restart",
+    "systemctl enable", "systemctl disable", "journalctl -u", "journalctl -f",
+    "ps aux", "ps aux | grep", "kill", "killall", "top", "htop",
+    "df -h", "du -sh", "free -h", "uptime", "uname -a",
+    "ip addr", "ip route", "ping", "curl", "wget",
+    "git status", "git log", "git pull", "git push", "git add", "git commit -m",
+    "git diff", "git branch", "git checkout", "git stash",
+    "python3", "python3 -m", "pip3 install", "pip3 list",
+    "chmod", "chown", "mkdir", "mkdir -p", "rm", "rm -rf", "mv", "cp", "cp -r",
+    "echo", "export", "source", "which", "man", "history", "clear",
+    "tar -czf", "tar -xzf", "zip", "unzip",
+    "ssh", "scp", "rsync",
+    "docker ps", "docker images", "docker run", "docker stop", "docker logs",
+    "docker-compose up", "docker-compose down",
+    "crontab -e", "crontab -l",
+    "passwd", "whoami", "id", "groups",
 )
 
-private fun shortcutColor(index: Int): Color =
-    SHORTCUT_COLORS[index % SHORTCUT_COLORS.size]
+fun computeSuggestions(partial: String, history: List<String>): List<String> {
+    if (partial.length < 2) return emptyList()
+    val lower = partial.lowercase()
+    val fromHistory = history.filter { it.lowercase().startsWith(lower) }
+    val fromCommon  = COMMON_COMMANDS.filter { it.lowercase().startsWith(lower) && !fromHistory.contains(it) }
+    return (fromHistory + fromCommon).take(8)
+}
 
 // ══════════════════════════════════════════════════════════════════════════════
 //  Émulateur VT100 / xterm-256color
@@ -105,6 +187,10 @@ class TerminalEmulator(initialCols: Int = 80, initialRows: Int = 24) {
 
     private val _scrollback = mutableListOf<AnnotatedString>()
     val scrollback: List<AnnotatedString> get() = _scrollback
+
+    // Raw text scrollback for syntax tinting
+    private val _scrollbackRaw = mutableListOf<String>()
+    val scrollbackRaw: List<String> get() = _scrollbackRaw
 
     var cursorRow = 0; private set
     var cursorCol = 0; private set
@@ -156,6 +242,9 @@ class TerminalEmulator(initialCols: Int = 80, initialRows: Int = 24) {
             }
         }
 
+    fun toScreenLinesRaw(): List<String> =
+        grid.map { row -> row.map { it.char }.joinToString("") }
+
     private fun processChar(c: Char) {
         when {
             inOSC    -> { if (c == '\u0007' || c == '\u001B') { inOSC = false; buf.clear() } }
@@ -204,8 +293,10 @@ class TerminalEmulator(initialCols: Int = 80, initialRows: Int = 24) {
 
     private fun scrollUp() {
         if (scrollTop == 0) {
+            val rawLine = grid[scrollTop].map { it.char }.joinToString("")
             _scrollback.add(renderRow(scrollTop))
-            if (_scrollback.size > 5000) _scrollback.removeAt(0)
+            _scrollbackRaw.add(rawLine)
+            if (_scrollback.size > 5000) { _scrollback.removeAt(0); _scrollbackRaw.removeAt(0) }
         }
         for (i in scrollTop until scrollBot) grid[i] = grid[i + 1]
         grid[scrollBot] = Array(cols) { Cell() }
@@ -271,8 +362,13 @@ class TerminalEmulator(initialCols: Int = 80, initialRows: Int = 24) {
             'M'       -> {
                 val cnt     = p1(0)
                 val safeEnd = (scrollBot - cnt).coerceAtLeast(cursorRow)
-                for (i in cursorRow..safeEnd) grid[i] = grid[i + cnt]
-                for (i in maxOf(cursorRow, scrollBot - cnt + 1)..scrollBot) clearRow(i)
+                if (cursorRow <= safeEnd) {
+                    for (i in cursorRow..safeEnd) grid[i] = grid[i + cnt]
+                }
+                val clearFrom = maxOf(cursorRow, scrollBot - cnt + 1)
+                if (clearFrom <= scrollBot) {
+                    for (i in clearFrom..scrollBot) clearRow(i)
+                }
             }
             'P'       -> {
                 val cnt = p1(0); val row = grid[cursorRow]
@@ -371,9 +467,7 @@ private val SPECIAL_KEYS = listOf(
 )
 
 // ── Regex d'interception des éditeurs texte ───────────────────────────────────
-private val EDITOR_CMD_REGEX = Regex(
-    """^\s*(?:sudo\s+)?(?:nano|vi|vim)\s+(.+?)\s*$"""
-)
+private val EDITOR_CMD_REGEX = Regex("""^\s*(?:sudo\s+)?(?:nano|vi|vim)\s+(.+?)\s*$""")
 
 // ══════════════════════════════════════════════════════════════════════════════
 //  Constantes de connexion
@@ -391,6 +485,84 @@ private data class EditorState(
     val isLoading     : Boolean = true,
     val sessionId     : Long    = System.currentTimeMillis()
 )
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  Dialog : ajouter / éditer un snippet
+// ══════════════════════════════════════════════════════════════════════════════
+@Composable
+private fun SnippetDialog(
+    initialLabel  : String = "",
+    initialCommand: String = "",
+    title         : String = "Nouveau snippet",
+    onConfirm     : (label: String, command: String) -> Unit,
+    onDelete      : (() -> Unit)? = null,
+    onDismiss     : () -> Unit
+) {
+    var label   by remember { mutableStateOf(initialLabel) }
+    var command by remember { mutableStateOf(initialCommand) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor   = Color(0xFF1A1A1A),
+        titleContentColor= TerminalGreen,
+        title = { Text(title, fontFamily = FontFamily.Monospace) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                OutlinedTextField(
+                    value          = label,
+                    onValueChange  = { label = it },
+                    label          = { Text("Nom affiché", fontFamily = FontFamily.Monospace, fontSize = 11.sp) },
+                    singleLine     = true,
+                    colors         = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor   = TerminalGreen,
+                        unfocusedBorderColor = Color(0xFF444444),
+                        focusedTextColor     = TerminalGreen,
+                        unfocusedTextColor   = TERM_DEFAULT_FG,
+                        cursorColor          = TerminalGreen,
+                        focusedLabelColor    = TerminalGreen,
+                        unfocusedLabelColor  = Color(0xFF888888)
+                    ),
+                    textStyle = TextStyle(fontFamily = FontFamily.Monospace, fontSize = 12.sp)
+                )
+                OutlinedTextField(
+                    value          = command,
+                    onValueChange  = { command = it },
+                    label          = { Text("Commande", fontFamily = FontFamily.Monospace, fontSize = 11.sp) },
+                    singleLine     = false,
+                    minLines       = 2,
+                    colors         = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor   = TerminalGreen,
+                        unfocusedBorderColor = Color(0xFF444444),
+                        focusedTextColor     = TerminalGreen,
+                        unfocusedTextColor   = TERM_DEFAULT_FG,
+                        cursorColor          = TerminalGreen,
+                        focusedLabelColor    = TerminalGreen,
+                        unfocusedLabelColor  = Color(0xFF888888)
+                    ),
+                    textStyle = TextStyle(fontFamily = FontFamily.Monospace, fontSize = 12.sp)
+                )
+            }
+        },
+        confirmButton = {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (onDelete != null) {
+                    TextButton(onClick = onDelete) {
+                        Text("Supprimer", color = Color(0xFFFF5555), fontFamily = FontFamily.Monospace, fontSize = 11.sp)
+                    }
+                }
+                TextButton(onClick = onDismiss) {
+                    Text("Annuler", color = Color(0xFF888888), fontFamily = FontFamily.Monospace, fontSize = 11.sp)
+                }
+                TextButton(
+                    onClick  = { if (label.isNotBlank() && command.isNotBlank()) onConfirm(label.trim(), command.trim()) },
+                    enabled  = label.isNotBlank() && command.isNotBlank()
+                ) {
+                    Text("OK", color = TerminalGreen, fontFamily = FontFamily.Monospace, fontSize = 11.sp)
+                }
+            }
+        }
+    )
+}
 
 // ══════════════════════════════════════════════════════════════════════════════
 //  Composable principal
@@ -431,13 +603,27 @@ fun TerminalScreen(settings: SettingsManager, onClose: () -> Unit) {
     var termCols   by remember { mutableIntStateOf(80) }
     var termRows   by remember { mutableIntStateOf(24) }
 
+    // ── Nouveautés ─────────────────────────────────────────────────────────────
+    val commandHistory   = remember { CommandHistory() }
+    val localShortcuts   = remember { settings.shortcuts.toMutableStateList() }
+
+    // Dialog état
+    var showAddSnippet       by remember { mutableStateOf(false) }
+    var editSnippetIndex     by remember { mutableStateOf<Int?>(null) }
+
+    // Suggestions d'autocomplétion
+    var suggestions          by remember { mutableStateOf<List<String>>(emptyList()) }
+    // ── Fin nouveautés ─────────────────────────────────────────────────────────
+
     var cursorVisible by remember { mutableStateOf(true) }
     LaunchedEffect(Unit) { while (true) { delay(530); cursorVisible = !cursorVisible } }
 
     val screenLines        = remember(renderTick) { emulator.toScreenLines(showCursor = false) }
+    val screenLinesRaw     = remember(renderTick) { emulator.toScreenLinesRaw() }
     val cursorRow          = emulator.cursorRow
     val cursorCol          = emulator.cursorCol
     val scrollbackSnapshot = remember(renderTick) { emulator.scrollback.toList() }
+    val scrollbackRawSnapshot = remember(renderTick) { emulator.scrollbackRaw.toList() }
     val totalLines         = scrollbackSnapshot.size + screenLines.size
     val listState          = rememberLazyListState()
 
@@ -452,7 +638,14 @@ fun TerminalScreen(settings: SettingsManager, onClose: () -> Unit) {
 
     var editorState by remember { mutableStateOf<EditorState?>(null) }
     var typedLine   by remember { mutableStateOf("") }
-    val shortcuts   = remember { settings.shortcuts }
+
+    // Recalcule les suggestions à chaque changement de typedLine
+    LaunchedEffect(typedLine) {
+        suggestions = if (typedLine.isNotEmpty())
+            computeSuggestions(typedLine, commandHistory.entries)
+        else
+            emptyList()
+    }
 
     fun toggleRotation() {
         val a = context as? Activity ?: return
@@ -477,6 +670,9 @@ fun TerminalScreen(settings: SettingsManager, onClose: () -> Unit) {
         when {
             bytes == "\r" -> {
                 val cmd   = typedLine.trim()
+                // Ajoute à l'historique avant de réinitialiser
+                if (cmd.isNotEmpty()) commandHistory.add(cmd)
+                suggestions = emptyList()
                 typedLine = ""
                 val match = EDITOR_CMD_REGEX.find(cmd)
                 if (match != null && isConnected) {
@@ -503,7 +699,34 @@ fun TerminalScreen(settings: SettingsManager, onClose: () -> Unit) {
             }
             bytes == "\u0015" || bytes == "\u0003" -> {
                 typedLine = ""
+                suggestions = emptyList()
+                commandHistory.reset()
                 scope.launch { session?.sendRaw(bytes) }
+            }
+            // ↑ : navigation historique
+            bytes == "\u001B[A" -> {
+                val prev = commandHistory.goUp()
+                if (prev != null) {
+                    // Efface la ligne courante et tape la commande historique
+                    val clearLine = "\u0015"          // Ctrl+U
+                    scope.launch {
+                        session?.sendRaw(clearLine)
+                        session?.sendRaw(prev)
+                    }
+                    typedLine = prev
+                } else {
+                    scope.launch { session?.sendRaw(bytes) }
+                }
+            }
+            // ↓ : navigation historique
+            bytes == "\u001B[B" -> {
+                val next = commandHistory.goDown()
+                val clearLine = "\u0015"
+                scope.launch {
+                    session?.sendRaw(clearLine)
+                    session?.sendRaw(next)
+                }
+                typedLine = next
             }
             bytes.startsWith("\u001B") -> {
                 typedLine = ""
@@ -518,7 +741,20 @@ fun TerminalScreen(settings: SettingsManager, onClose: () -> Unit) {
 
     fun sendCommand(cmd: String) {
         if (cmd.isBlank() || !isConnected) return
+        commandHistory.add(cmd)
         scope.launch { session?.sendRaw("$cmd\r") }
+    }
+
+    /** Insère une suggestion d'autocomplétion dans la ligne en cours */
+    fun applySuggestion(suggestion: String) {
+        val clearLine = "\u0015"   // Ctrl+U
+        scope.launch {
+            session?.sendRaw(clearLine)
+            session?.sendRaw(suggestion)
+        }
+        typedLine   = suggestion
+        suggestions = emptyList()
+        commandHistory.reset()
     }
 
     suspend fun connectSsh() {
@@ -618,6 +854,43 @@ fun TerminalScreen(settings: SettingsManager, onClose: () -> Unit) {
     }
 
     // ══════════════════════════════════════════════════════════════════════════
+    //  Dialogs snippets
+    // ══════════════════════════════════════════════════════════════════════════
+    if (showAddSnippet) {
+        SnippetDialog(
+            initialCommand = typedLine,
+            title          = "Ajouter un snippet",
+            onConfirm = { label, command ->
+                localShortcuts.add(label to command)
+                settings.shortcuts = localShortcuts.toList()
+                showAddSnippet = false
+            },
+            onDismiss = { showAddSnippet = false }
+        )
+    }
+
+    val editIdx = editSnippetIndex
+    if (editIdx != null && editIdx < localShortcuts.size) {
+        val (el, ec) = localShortcuts[editIdx]
+        SnippetDialog(
+            initialLabel   = el,
+            initialCommand = ec,
+            title          = "Modifier le snippet",
+            onConfirm = { label, command ->
+                localShortcuts[editIdx] = label to command
+                settings.shortcuts = localShortcuts.toList()
+                editSnippetIndex = null
+            },
+            onDelete = {
+                localShortcuts.removeAt(editIdx)
+                settings.shortcuts = localShortcuts.toList()
+                editSnippetIndex = null
+            },
+            onDismiss = { editSnippetIndex = null }
+        )
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
     //  Affichage
     // ══════════════════════════════════════════════════════════════════════════
     val currentEditorState = editorState
@@ -694,11 +967,7 @@ fun TerminalScreen(settings: SettingsManager, onClose: () -> Unit) {
                                 renderTick++
                                 scope.launch { connectSsh() }
                             }) {
-                                Icon(
-                                    Icons.Default.Refresh,
-                                    contentDescription = "Reconnecter",
-                                    tint = Color.Yellow
-                                )
+                                Icon(Icons.Default.Refresh, contentDescription = "Reconnecter", tint = Color.Yellow)
                             }
                         }
                         if (isLandscape) {
@@ -737,7 +1006,6 @@ fun TerminalScreen(settings: SettingsManager, onClose: () -> Unit) {
                     .background(TerminalBg)
                     .imePadding()
             ) {
-                // ── Bannière de reconnexion ────────────────────────────────────
                 if (isReconnecting) {
                     Box(
                         modifier = Modifier
@@ -749,32 +1017,15 @@ fun TerminalScreen(settings: SettingsManager, onClose: () -> Unit) {
                             verticalAlignment     = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
-                            CircularProgressIndicator(
-                                modifier    = Modifier.size(12.dp),
-                                strokeWidth = 2.dp,
-                                color       = Color(0xFFFFD93D)
-                            )
-                            Text(
-                                text       = status,
-                                color      = Color(0xFFFFD93D),
-                                fontSize   = 11.sp,
-                                fontFamily = FontFamily.Monospace
-                            )
+                            CircularProgressIndicator(modifier = Modifier.size(12.dp), strokeWidth = 2.dp, color = Color(0xFFFFD93D))
+                            Text(text = status, color = Color(0xFFFFD93D), fontSize = 11.sp, fontFamily = FontFamily.Monospace)
                         }
                     }
                 }
 
                 // ── Zone terminal ─────────────────────────────────────────────
-                Box(
-                    modifier = Modifier
-                        .weight(1f)
-                        .fillMaxWidth()
-                        .background(TerminalBg)
-                ) {
-                    // LocalDensity doit être capturé dans la composition,
-                    // avant d'être utilisé dans le callback onSizeChanged.
+                Box(modifier = Modifier.weight(1f).fillMaxWidth().background(TerminalBg)) {
                     val density = LocalDensity.current
-
                     Box(
                         modifier = Modifier
                             .fillMaxSize()
@@ -864,32 +1115,19 @@ fun TerminalScreen(settings: SettingsManager, onClose: () -> Unit) {
                                     .horizontalScroll(hScroll)
                                     .padding(horizontal = 4.dp, vertical = 2.dp)
                             ) {
-                                items(scrollbackSnapshot) { line ->
-                                    Text(
-                                        line,
-                                        fontFamily = FontFamily.Monospace,
-                                        fontSize   = fontSize.sp,
-                                        lineHeight = (fontSize * 1.27f).sp,
-                                        softWrap   = false
-                                    )
-                                }
-                                screenLines.forEachIndexed { idx, line ->
-                                    item(key = "sr_$idx") {
-                                        if (isConnected && idx == cursorRow) {
-                                            val withCursor = remember(line, cursorCol, cursorVisible) {
-                                                if (!cursorVisible) line
-                                                else buildAnnotatedString {
-                                                    line.spanStyles.forEach { addStyle(it.item, it.start, it.end) }
-                                                    append(line.text)
-                                                    val ci = cursorCol.coerceAtMost(line.length)
-                                                    addStyle(
-                                                        SpanStyle(color = TerminalBg, background = TERM_DEFAULT_FG),
-                                                        ci, (ci + 1).coerceAtMost(line.length)
-                                                    )
-                                                }
-                                            }
+                                // ── Scrollback avec coloration syntaxique ─────
+                                scrollbackSnapshot.forEachIndexed { idx, line ->
+                                    item(key = "sb_$idx") {
+                                        val rawText = scrollbackRawSnapshot.getOrElse(idx) { "" }
+                                        val tint    = syntaxTintForLine(rawText)
+                                        if (tint != null) {
+                                            // Applique un overlay de couleur sur toute la ligne
                                             Text(
-                                                withCursor,
+                                                buildAnnotatedString {
+                                                    withStyle(SpanStyle(color = tint.copy(alpha = 0.85f))) {
+                                                        append(line.text)
+                                                    }
+                                                },
                                                 fontFamily = FontFamily.Monospace,
                                                 fontSize   = fontSize.sp,
                                                 lineHeight = (fontSize * 1.27f).sp,
@@ -906,6 +1144,98 @@ fun TerminalScreen(settings: SettingsManager, onClose: () -> Unit) {
                                         }
                                     }
                                 }
+
+                                // ── Screen lines avec curseur & coloration ────
+                                screenLines.forEachIndexed { idx, line ->
+                                    item(key = "sr_$idx") {
+                                        val rawText = screenLinesRaw.getOrElse(idx) { "" }
+                                        val tint    = if (idx != cursorRow) syntaxTintForLine(rawText) else null
+
+                                        val displayLine: AnnotatedString = when {
+                                            isConnected && idx == cursorRow -> {
+                                                remember(line, cursorCol, cursorVisible) {
+                                                    if (!cursorVisible) line
+                                                    else buildAnnotatedString {
+                                                        line.spanStyles.forEach { addStyle(it.item, it.start, it.end) }
+                                                        append(line.text)
+                                                        val ci = cursorCol.coerceAtMost(line.length)
+                                                        addStyle(
+                                                            SpanStyle(color = TerminalBg, background = TERM_DEFAULT_FG),
+                                                            ci, (ci + 1).coerceAtMost(line.length)
+                                                        )
+                                                    }
+                                                }
+                                            }
+                                            tint != null -> buildAnnotatedString {
+                                                withStyle(SpanStyle(color = tint.copy(alpha = 0.85f))) { append(line.text) }
+                                            }
+                                            else -> line
+                                        }
+
+                                        Text(
+                                            displayLine,
+                                            fontFamily = FontFamily.Monospace,
+                                            fontSize   = fontSize.sp,
+                                            lineHeight = (fontSize * 1.27f).sp,
+                                            softWrap   = false
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ══════════════════════════════════════════════════════════════
+                //  Barre d'autocomplétion
+                // ══════════════════════════════════════════════════════════════
+                if (suggestions.isNotEmpty() && isConnected) {
+                    HorizontalDivider(color = Color(0xFF1E3A1E), thickness = 0.5.dp)
+                    LazyRow(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(Color(0xFF0A1A0A))
+                            .padding(horizontal = 6.dp, vertical = 3.dp),
+                        horizontalArrangement = Arrangement.spacedBy(4.dp),
+                        verticalAlignment     = Alignment.CenterVertically
+                    ) {
+                        // Bouton "enregistrer comme snippet" si typedLine non vide
+                        item {
+                            Box(
+                                modifier = Modifier
+                                    .height(24.dp)
+                                    .background(Color(0xFF1A3A1A), RoundedCornerShape(4.dp))
+                                    .clickable { showAddSnippet = true }
+                                    .padding(horizontal = 8.dp),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text("＋ snippet", color = TerminalGreen.copy(0.6f), fontSize = 9.sp, fontFamily = FontFamily.Monospace)
+                            }
+                        }
+                        items(suggestions) { suggestion ->
+                            Box(
+                                modifier = Modifier
+                                    .height(24.dp)
+                                    .background(Color(0xFF1A2A1A), RoundedCornerShape(4.dp))
+                                    .clickable { applySuggestion(suggestion) }
+                                    .padding(horizontal = 8.dp),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                // Surligne la partie déjà tapée
+                                val prefix = typedLine.length.coerceAtMost(suggestion.length)
+                                Text(
+                                    buildAnnotatedString {
+                                        withStyle(SpanStyle(color = TerminalGreen, fontWeight = FontWeight.Bold)) {
+                                            append(suggestion.take(prefix))
+                                        }
+                                        withStyle(SpanStyle(color = TerminalGreen.copy(0.55f))) {
+                                            append(suggestion.drop(prefix))
+                                        }
+                                    },
+                                    fontSize   = 10.sp,
+                                    fontFamily = FontFamily.Monospace,
+                                    softWrap   = false
+                                )
                             }
                         }
                     }
@@ -932,12 +1262,7 @@ fun TerminalScreen(settings: SettingsManager, onClose: () -> Unit) {
                             altActive = !altActive; if (altActive) ctrlActive = false
                         }
 
-                        Box(
-                            modifier = Modifier
-                                .width(1.dp)
-                                .height(20.dp)
-                                .background(Color(0xFF333333))
-                        )
+                        Box(modifier = Modifier.width(1.dp).height(20.dp).background(Color(0xFF333333)))
 
                         CompactKey(label = "Paste", enabled = isConnected) { pasteFromClipboard() }
 
@@ -946,26 +1271,39 @@ fun TerminalScreen(settings: SettingsManager, onClose: () -> Unit) {
                         }
                     }
 
-                    if (shortcuts.isNotEmpty()) {
-                        HorizontalDivider(color = Color(0xFF222222), thickness = 0.5.dp)
-                        LazyRow(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .background(Color(0xFF0A0A0A))
-                                .padding(horizontal = 6.dp, vertical = 4.dp),
-                            horizontalArrangement = Arrangement.spacedBy(6.dp),
-                            verticalAlignment     = Alignment.CenterVertically
-                        ) {
-                            items(shortcuts.size) { idx ->
-                                val (label, cmd) = shortcuts[idx]
-                                val color        = shortcutColor(idx)
-                                ShortcutChip(
-                                    label   = label,
-                                    color   = color,
-                                    enabled = isConnected,
-                                    onClick = { sendCommand(cmd) }
-                                )
+                    // ── Barre des snippets avec bouton "+" ────────────────────
+                    HorizontalDivider(color = Color(0xFF222222), thickness = 0.5.dp)
+                    LazyRow(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(Color(0xFF0A0A0A))
+                            .padding(horizontal = 6.dp, vertical = 4.dp),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalAlignment     = Alignment.CenterVertically
+                    ) {
+                        // Bouton "+"
+                        item {
+                            Box(
+                                modifier = Modifier
+                                    .height(26.dp)
+                                    .background(Color(0xFF1A1A2A), RoundedCornerShape(6.dp))
+                                    .clickable { showAddSnippet = true }
+                                    .padding(horizontal = 10.dp),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text("+", color = Color(0xFF888888), fontSize = 14.sp, fontFamily = FontFamily.Monospace)
                             }
+                        }
+                        items(localShortcuts.size) { idx ->
+                            val (label, cmd) = localShortcuts[idx]
+                            val color        = shortcutColor(idx)
+                            ShortcutChip(
+                                label   = label,
+                                color   = color,
+                                enabled = isConnected,
+                                onLongClick = { editSnippetIndex = idx },
+                                onClick = { sendCommand(cmd) }
+                            )
                         }
                     }
 
@@ -977,8 +1315,7 @@ fun TerminalScreen(settings: SettingsManager, onClose: () -> Unit) {
                                 .padding(horizontal = 8.dp, vertical = 2.dp)
                         ) {
                             Text(
-                                text       = if (ctrlActive) "^ Ctrl actif — tapez une lettre"
-                                else            "Alt actif — tapez une touche",
+                                text       = if (ctrlActive) "^ Ctrl actif — tapez une lettre" else "Alt actif — tapez une touche",
                                 color      = Color(0xFFFCE94F),
                                 fontSize   = 10.sp,
                                 fontFamily = FontFamily.Monospace
@@ -991,13 +1328,14 @@ fun TerminalScreen(settings: SettingsManager, onClose: () -> Unit) {
     }
 }
 
-// ── Chip de raccourci coloré ──────────────────────────────────────────────────
+// ── Chip de raccourci coloré avec support long-press ─────────────────────────
 @Composable
 private fun ShortcutChip(
-    label  : String,
-    color  : Color,
-    enabled: Boolean,
-    onClick: () -> Unit
+    label      : String,
+    color      : Color,
+    enabled    : Boolean,
+    onLongClick: () -> Unit = {},
+    onClick    : () -> Unit
 ) {
     val bgColor     = color.copy(alpha = 0.10f)
     val borderColor = color.copy(alpha = if (enabled) 0.55f else 0.20f)
@@ -1008,7 +1346,18 @@ private fun ShortcutChip(
         label   = {
             Row(
                 verticalAlignment     = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(4.dp)
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                modifier = Modifier.pointerInput(Unit) {
+                    awaitPointerEventScope {
+                        while (true) {
+                            val event = awaitPointerEvent()
+                            val isLong = event.changes.any {
+                                !it.pressed && it.uptimeMillis - it.previousUptimeMillis > 400
+                            }
+                            if (isLong) onLongClick()
+                        }
+                    }
+                }
             ) {
                 Box(
                     modifier = Modifier
@@ -1018,21 +1367,11 @@ private fun ShortcutChip(
                             shape = androidx.compose.foundation.shape.CircleShape
                         )
                 )
-                Text(
-                    text       = label,
-                    fontFamily = FontFamily.Monospace,
-                    fontSize   = 10.sp,
-                    color      = textColor
-                )
+                Text(text = label, fontFamily = FontFamily.Monospace, fontSize = 10.sp, color = textColor)
             }
         },
-        colors  = SuggestionChipDefaults.suggestionChipColors(
-            containerColor = bgColor
-        ),
-        border  = SuggestionChipDefaults.suggestionChipBorder(
-            enabled     = true,
-            borderColor = borderColor
-        ),
+        colors  = SuggestionChipDefaults.suggestionChipColors(containerColor = bgColor),
+        border  = SuggestionChipDefaults.suggestionChipBorder(enabled = true, borderColor = borderColor),
         modifier = Modifier.height(26.dp)
     )
 }
@@ -1063,10 +1402,7 @@ private fun CompactModifierKey(label: String, active: Boolean, enabled: Boolean,
             enabled        = enabled,
             modifier       = Modifier.height(28.dp),
             contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp),
-            colors         = ButtonDefaults.buttonColors(
-                containerColor = TerminalGreen,
-                contentColor   = Color.Black
-            )
+            colors         = ButtonDefaults.buttonColors(containerColor = TerminalGreen, contentColor = Color.Black)
         ) {
             Text(label, fontFamily = FontFamily.Monospace, fontSize = 10.sp, fontWeight = FontWeight.Bold)
         }

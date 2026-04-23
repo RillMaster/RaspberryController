@@ -6,12 +6,10 @@ import org.json.JSONArray
 class SettingsManager(context: Context) {
     private val prefs = context.getSharedPreferences("ssh_settings", Context.MODE_PRIVATE)
 
-    // ─── Premier lancement ───────────────────────────────────────────────────────
     var isFirstLaunch: Boolean
         get() = prefs.getBoolean("first_launch", true)
         set(value) = prefs.edit().putBoolean("first_launch", value).apply()
 
-    // ─── SSH ────────────────────────────────────────────────────────────────────
     var host: String
         get() = prefs.getString("host", "") ?: ""
         set(value) = prefs.edit().putString("host", value).apply()
@@ -28,30 +26,35 @@ class SettingsManager(context: Context) {
         get() = prefs.getString("password", "") ?: ""
         set(value) = prefs.edit().putString("password", value).apply()
 
-    // ─── Timeout SSH (en ms) ─────────────────────────────────────────────────────
-    // Valeurs possibles : 5000, 8000, 15000, 30000
+    // Pi-hole
+    var piHolePassword: String
+        get()      = prefs.getString("pihole_password", "") ?: ""
+        set(value) = prefs.edit().putString("pihole_password", value).apply()
+
+    var piHoleAutoRefresh: Boolean
+        get()      = prefs.getBoolean("pihole_auto_refresh", true)
+        set(value) = prefs.edit().putBoolean("pihole_auto_refresh", value).apply()
+
+    var piHoleRefreshDelaySec: Int
+        get()      = prefs.getInt("pihole_refresh_delay_sec", 30)
+        set(value) = prefs.edit().putInt("pihole_refresh_delay_sec", value).apply()
+
     var sshTimeoutMs: Int
         get() = prefs.getInt("ssh_timeout_ms", 8000)
         set(value) = prefs.edit().putInt("ssh_timeout_ms", value).apply()
 
-    // ─── Intervalle de rafraîchissement température (en ms) ──────────────────────
-    // Valeurs possibles : 1000, 2000, 5000, 10000
     var tempRefreshMs: Int
         get() = prefs.getInt("temp_refresh_ms", 2000)
         set(value) = prefs.edit().putInt("temp_refresh_ms", value).apply()
 
-    // ─── Thème ───────────────────────────────────────────────────────────────────
-    // Valeurs : "system", "light", "dark"
     var theme: String
         get() = prefs.getString("theme", "system") ?: "system"
         set(value) = prefs.edit().putString("theme", value).apply()
 
-    // ─── Sécurité ────────────────────────────────────────────────────────────────
     var biometricEnabled: Boolean
         get() = prefs.getBoolean("biometric_enabled", false)
         set(value) = prefs.edit().putBoolean("biometric_enabled", value).apply()
 
-    // ─── Raccourcis terminal ─────────────────────────────────────────────────────
     var shortcuts: List<Pair<String, String>>
         get() {
             val json = prefs.getString("shortcuts", null) ?: return defaultShortcuts()

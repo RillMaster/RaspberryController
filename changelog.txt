@@ -1,4 +1,15 @@
-- Fixed terminal lag
-- Added CPU and RAM stats
-- Added color to terminal shortcuts
+💻 Terminal Improvements
+Command History (swipe up to recall)
+Saved Favorite Commands (like snippets)
+Basic Syntax Highlighting of Output (errors in red, successes in green)
+Autocompletion for Frequent Commands
 
+🐳 Service Management
+List of Docker containers with start/stop/restart
+Toggle Pi-hole on/off + stats (blocked requests)
+WireGuard status + list of connected clients
+
+📊 Advanced Monitoring
+Historical CPU/RAM graphs (like a 10-minute sparkline)
+GPU temperature (if applicable)
+Disk space per partition

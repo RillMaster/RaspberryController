@@ -5,7 +5,6 @@ package com.example.raspberrycontroller
 import androidx.biometric.BiometricManager.Authenticators.BIOMETRIC_STRONG
 import androidx.biometric.BiometricManager.Authenticators.DEVICE_CREDENTIAL
 import androidx.biometric.BiometricManager
-import android.app.AlertDialog
 import android.os.Bundle
 import android.os.Build
 import androidx.activity.compose.setContent
@@ -29,6 +28,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
 import androidx.fragment.app.FragmentActivity
 import androidx.lifecycle.lifecycleScope
 import com.example.raspberrycontroller.ui.theme.RaspberryControllerTheme
@@ -38,7 +38,6 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import sh.calvin.reorderable.ReorderableColumn
-import sh.calvin.reorderable.ReorderableItem
 import java.net.URL
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -46,37 +45,59 @@ import java.net.URL
 // ══════════════════════════════════════════════════════════════════════════════
 data class SystemStats(
     val tempCelsius: Double,
-    val cpuPercent: Int,
-    val ramUsedMb: Int,
-    val ramTotalMb: Int
+    val cpuPercent : Int,
+    val ramUsedMb  : Int,
+    val ramTotalMb : Int
 )
 
-suspend fun fetchSystemStats(settings: SettingsManager): SystemStats? {
-    val cmd = """python3 -c "
-import os
+private val SYSTEM_STATS_SCRIPT = """
+import re, time
+
+meminfo = open('/proc/meminfo').read()
+def mi(k):
+    m = re.search(r'^' + k + r':\s+(\d+)', meminfo, re.MULTILINE)
+    return int(m.group(1)) if m else 0
+
+mem_total = mi('MemTotal')
+mem_avail = mi('MemAvailable')
+mem_used  = mem_total - mem_avail
+
+def read_cpu():
+    vals = list(map(int, open('/proc/stat').readline().split()[1:]))
+    return vals[3], sum(vals)
+
+idle1, total1 = read_cpu()
+time.sleep(0.5)
+idle2, total2 = read_cpu()
+dt = total2 - total1
+cpu_pct = round((1.0 - (idle2 - idle1) / dt) * 100.0, 1) if dt > 0 else 0.0
+
 temp = int(open('/sys/class/thermal/thermal_zone0/temp').read()) / 1000.0
-cpu = float(open('/proc/loadavg').read().split()[0])
-mem = open('/proc/meminfo').read()
-def mi(k): return int([l for l in mem.split('\n') if l.startswith(k)][0].split()[1])
-total=mi('MemTotal'); free=mi('MemAvailable')
-used=total-free
-print(f'{temp:.1f},{cpu:.2f},{used//1024},{total//1024}')
-""""
-    val raw = SshClient.execute(
-        settings.host, settings.port, settings.username, settings.password,
-        cmd, settings.sshTimeoutMs
-    )
-    val parts = raw.trim().split(",")
-    if (parts.size < 4) return null
-    return try {
-        SystemStats(
-            tempCelsius = parts[0].toDouble(),
-            cpuPercent  = (parts[1].toDouble() * 100).toInt().coerceIn(0, 100),
-            ramUsedMb   = parts[2].toInt(),
-            ramTotalMb  = parts[3].toInt()
-        )
-    } catch (_: Exception) { null }
-}
+
+print(str(round(temp,1))+','+str(cpu_pct)+','+str(mem_used//1024)+','+str(mem_total//1024))
+""".trimIndent()
+
+suspend fun fetchSystemStats(settings: SettingsManager): SystemStats? =
+    withContext(Dispatchers.IO) {
+        try {
+            val b64 = android.util.Base64.encodeToString(
+                SYSTEM_STATS_SCRIPT.toByteArray(), android.util.Base64.NO_WRAP
+            )
+            val raw = SshClient.execute(
+                settings.host, settings.port, settings.username, settings.password,
+                "echo '$b64' | base64 -d | python3",
+                settings.sshTimeoutMs
+            )
+            val parts = raw.trim().split(",")
+            if (parts.size < 4) return@withContext null
+            SystemStats(
+                tempCelsius = parts[0].toDouble(),
+                cpuPercent  = parts[1].toDouble().toInt().coerceIn(0, 100),
+                ramUsedMb   = parts[2].toInt(),
+                ramTotalMb  = parts[3].toInt()
+            )
+        } catch (_: Exception) { null }
+    }
 
 // ══════════════════════════════════════════════════════════════════════════════
 //  MainActivity
@@ -88,12 +109,14 @@ class MainActivity : FragmentActivity() {
     private val changelogUrl =
         "https://raw.githubusercontent.com/RillMaster/RaspberryController/main/changelog.txt"
 
+    private var downloadProgress = mutableIntStateOf(-2)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
 
         setContent {
-            val context = LocalContext.current
+            val context  = LocalContext.current
             val settings = remember { SettingsManager(context) }
             var themePref by remember { mutableStateOf(settings.theme) }
 
@@ -104,15 +127,74 @@ class MainActivity : FragmentActivity() {
             }
 
             RaspberryControllerTheme(darkTheme = darkTheme) {
+                val progress by downloadProgress
+                if (progress >= -1) {
+                    DownloadProgressDialog(
+                        progress  = progress,
+                        onDismiss = { if (progress == -1) downloadProgress.intValue = -2 }
+                    )
+                }
                 AppEntryPoint(
-                    activity        = this@MainActivity,
-                    settings        = settings,
-                    onThemeChanged  = { newTheme ->
+                    activity       = this@MainActivity,
+                    settings       = settings,
+                    onThemeChanged = { newTheme ->
                         settings.theme = newTheme
-                        themePref = newTheme
+                        themePref      = newTheme
                     },
                     onAppReady = { checkForUpdates() }
                 )
+            }
+        }
+    }
+
+    // ── Dialog progression téléchargement ────────────────────────────────────
+    @Composable
+    fun DownloadProgressDialog(progress: Int, onDismiss: () -> Unit) {
+        Dialog(onDismissRequest = { if (progress == -1) onDismiss() }) {
+            Card(
+                modifier = Modifier.fillMaxWidth().padding(16.dp),
+                shape    = MaterialTheme.shapes.large
+            ) {
+                Column(
+                    modifier            = Modifier.padding(24.dp),
+                    verticalArrangement = Arrangement.spacedBy(16.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Text("Mise à jour", style = MaterialTheme.typography.titleLarge)
+                    when {
+                        progress == -1 -> {
+                            Icon(Icons.Default.Error, contentDescription = null,
+                                tint = MaterialTheme.colorScheme.error, modifier = Modifier.size(48.dp))
+                            Text("Erreur lors du téléchargement",
+                                color = MaterialTheme.colorScheme.error,
+                                style = MaterialTheme.typography.bodyMedium)
+                            Button(onClick = onDismiss, modifier = Modifier.fillMaxWidth()) {
+                                Text("Fermer")
+                            }
+                        }
+                        progress == 100 -> {
+                            Icon(Icons.Default.CheckCircle, contentDescription = null,
+                                tint = Color(0xFF66BB6A), modifier = Modifier.size(48.dp))
+                            Text("Téléchargement terminé !", style = MaterialTheme.typography.bodyMedium)
+                            Text("L'installation va démarrer…",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                        else -> {
+                            Text("Téléchargement en cours…", style = MaterialTheme.typography.bodyMedium)
+                            LinearProgressIndicator(
+                                progress = { progress / 100f },
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                            Text("$progress%",
+                                style = MaterialTheme.typography.labelLarge,
+                                color = MaterialTheme.colorScheme.primary)
+                            Text("Veuillez patienter…",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                    }
+                }
             }
         }
     }
@@ -121,10 +203,9 @@ class MainActivity : FragmentActivity() {
     private fun checkForUpdates() {
         lifecycleScope.launch(Dispatchers.IO) {
             try {
-                val timestamp  = System.currentTimeMillis()
-                val jsonRaw    = URL("$versionUrl?t=$timestamp").readText().trim()
-                val jsonObject = JSONObject(jsonRaw)
-
+                val timestamp         = System.currentTimeMillis()
+                val jsonRaw           = URL("$versionUrl?t=$timestamp").readText().trim()
+                val jsonObject        = JSONObject(jsonRaw)
                 val latestVersionCode = jsonObject.getLong("versionCode")
                 val latestVersionName = jsonObject.optString("versionName", "Inconnue")
                 val apkUrl            = jsonObject.getString("url")
@@ -136,48 +217,37 @@ class MainActivity : FragmentActivity() {
                     packageManager.getPackageInfo(packageName, 0).versionCode.toLong()
                 }
 
-                if (latestVersionCode > currentVersionCode) {
-                    val changelog = try {
-                        URL("$changelogUrl?t=$timestamp").readText().trim()
-                    } catch (_: Exception) { "" }
-                    withContext(Dispatchers.Main) {
+                withContext(Dispatchers.Main) {
+                    if (latestVersionCode > currentVersionCode) {
+                        val changelog = try {
+                            withContext(Dispatchers.IO) {
+                                URL("$changelogUrl?t=$timestamp").readText().trim()
+                            }
+                        } catch (_: Exception) { "" }
                         showUpdateDialog(changelog, apkUrl, latestVersionName)
                     }
-                } else {
-                    withContext(Dispatchers.Main) {
-                        android.widget.Toast.makeText(
-                            this@MainActivity,
-                            "Vous êtes à jour (v$latestVersionName)",
-                            android.widget.Toast.LENGTH_SHORT
-                        ).show()
-                    }
                 }
-            } catch (e: Exception) {
-                e.printStackTrace()
-                withContext(Dispatchers.Main) {
-                    android.widget.Toast.makeText(
-                        this@MainActivity,
-                        "Erreur mise à jour: ${e.message}",
-                        android.widget.Toast.LENGTH_LONG
-                    ).show()
-                }
-            }
+            } catch (e: Exception) { e.printStackTrace() }
         }
     }
 
     private fun showUpdateDialog(changelog: String, downloadUrl: String, latestVersion: String) {
         val message = buildString {
             append("Une nouvelle version est disponible : v$latestVersion")
-            if (changelog.isNotEmpty()) {
-                append("\n\n📋 Nouveautés :\n$changelog")
-            }
+            if (changelog.isNotEmpty()) append("\n\n📋 Nouveautés :\n$changelog")
             append("\n\nVoulez-vous l'installer ?")
         }
-        AlertDialog.Builder(this)
+        android.app.AlertDialog.Builder(this)
             .setTitle("Mise à jour disponible")
             .setMessage(message)
             .setPositiveButton("Mettre à jour") { _, _ ->
-                UpdateManager(this).downloadAndInstall(downloadUrl)
+                downloadProgress.intValue = 0
+                UpdateManager(this).downloadAndInstall(downloadUrl) { progress ->
+                    downloadProgress.intValue = progress
+                    if (progress == 100) {
+                        lifecycleScope.launch { delay(3000); downloadProgress.intValue = -2 }
+                    }
+                }
             }
             .setNegativeButton("Plus tard", null)
             .show()
@@ -188,17 +258,17 @@ class MainActivity : FragmentActivity() {
     // ══════════════════════════════════════════════════════════════════════════
     @Composable
     fun AppEntryPoint(
-        activity       : FragmentActivity,
-        settings       : SettingsManager,
-        onThemeChanged : (String) -> Unit,
-        onAppReady     : () -> Unit
+        activity      : FragmentActivity,
+        settings      : SettingsManager,
+        onThemeChanged: (String) -> Unit,
+        onAppReady    : () -> Unit
     ) {
         var onboardingDone by remember { mutableStateOf(!settings.isFirstLaunch) }
 
         if (!onboardingDone) {
             OnboardingScreen(
-                activity  = activity,
-                settings  = settings,
+                activity   = activity,
+                settings   = settings,
                 onFinished = { onboardingDone = true }
             )
             return
@@ -229,13 +299,10 @@ class MainActivity : FragmentActivity() {
         } else {
             LaunchedEffect(Unit) { onAppReady() }
             MainApp(
-                activity          = activity,
-                settings          = settings,
-                onThemeChanged    = onThemeChanged,
-                onBiometricEnabled = {
-                    isAuthenticated = false
-                    authError = null
-                }
+                activity           = activity,
+                settings           = settings,
+                onThemeChanged     = onThemeChanged,
+                onBiometricEnabled = { isAuthenticated = false; authError = null }
             )
         }
     }
@@ -243,23 +310,17 @@ class MainActivity : FragmentActivity() {
     // ── Écran de verrouillage biométrique ─────────────────────────────────────
     @Composable
     fun BiometricLockScreen(error: String?, onRetry: () -> Unit) {
-        Surface(
-            modifier = Modifier.fillMaxSize(),
-            color    = MaterialTheme.colorScheme.background
-        ) {
-            Box(
-                modifier        = Modifier.fillMaxSize(),
-                contentAlignment = Alignment.Center
-            ) {
+        Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                 Column(
-                    horizontalAlignment  = Alignment.CenterHorizontally,
-                    verticalArrangement  = Arrangement.spacedBy(16.dp),
-                    modifier             = Modifier.padding(40.dp)
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(16.dp),
+                    modifier            = Modifier.padding(40.dp)
                 ) {
                     Text("🔒", fontSize = 56.sp)
                     Text("RaspberryController", style = MaterialTheme.typography.headlineSmall)
                     Text(
-                        text  = "Authentification requise pour accéder à l'application.",
+                        "Authentification requise pour accéder à l'application.",
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -285,7 +346,9 @@ class MainActivity : FragmentActivity() {
         }
     }
 
-    // ── Navigation principale ─────────────────────────────────────────────────
+    // ══════════════════════════════════════════════════════════════════════════
+    //  MainApp — gestion de la navigation entre écrans
+    // ══════════════════════════════════════════════════════════════════════════
     @Composable
     fun MainApp(
         activity          : FragmentActivity,
@@ -293,8 +356,13 @@ class MainActivity : FragmentActivity() {
         onThemeChanged    : (String) -> Unit,
         onBiometricEnabled: () -> Unit
     ) {
-        var showSettings by remember { mutableStateOf(!settings.isConfigured()) }
-        var showTerminal by remember { mutableStateOf(false) }
+        var showSettings      by remember { mutableStateOf(!settings.isConfigured()) }
+        var showTerminal      by remember { mutableStateOf(false) }
+        var showDocker        by remember { mutableStateOf(false) }
+        var showMonitoring    by remember { mutableStateOf(false) }
+        var showPiHole        by remember { mutableStateOf(false) }
+        var showPiHoleConfig  by remember { mutableStateOf(false) }   // ← nouveau
+        var showWireGuard     by remember { mutableStateOf(false) }
 
         when {
             showSettings -> SettingsScreen(
@@ -308,17 +376,40 @@ class MainActivity : FragmentActivity() {
                 settings = settings,
                 onClose  = { showTerminal = false }
             )
+            showDocker -> DockerScreen(
+                settings = settings,
+                onClose  = { showDocker = false }
+            )
+            showMonitoring -> MonitoringScreen(
+                settings = settings,
+                onClose  = { showMonitoring = false }
+            )
+            // ── Config Pi-hole : prioritaire sur PiHoleScreen ──────────────
+            showPiHoleConfig -> PiHoleConfigScreen(
+                settings = settings,
+                onClose  = { showPiHoleConfig = false },
+                onSaved  = { showPiHoleConfig = false }   // retour à PiHoleScreen après save
+            )
+            showPiHole -> PiHoleScreen(
+                settings     = settings,
+                onClose      = { showPiHole = false },
+                onOpenConfig = { showPiHoleConfig = true }  // ← ouvre la config
+            )
+            showWireGuard -> WireGuardScreen(
+                settings = settings,
+                onClose  = { showWireGuard = false }
+            )
             else -> ControlScreen(
-                settings      = settings,
-                onOpenSettings = { showSettings = true },
-                onOpenTerminal = { showTerminal = true },
-                onSshCommand   = { cmd, s, callback ->
+                settings         = settings,
+                onOpenSettings   = { showSettings = true },
+                onOpenTerminal   = { showTerminal = true },
+                onOpenDocker     = { showDocker = true },
+                onOpenMonitoring = { showMonitoring = true },
+                onOpenPiHole     = { showPiHole = true },
+                onOpenWireGuard  = { showWireGuard = true },
+                onSshCommand     = { cmd, s, callback ->
                     activity.lifecycleScope.launch {
-                        callback(
-                            SshClient.execute(
-                                s.host, s.port, s.username, s.password, cmd, s.sshTimeoutMs
-                            )
-                        )
+                        callback(SshClient.execute(s.host, s.port, s.username, s.password, cmd, s.sshTimeoutMs))
                     }
                 },
                 onLed = { state, s, callback ->
@@ -336,7 +427,7 @@ class MainActivity : FragmentActivity() {
         }
     }
 
-    // ── Helpers UI ────────────────────────────────────────────────────────────
+    // ── Titre de section ──────────────────────────────────────────────────────
     @Composable
     fun SectionTitle(text: String) {
         Text(
@@ -365,34 +456,25 @@ class MainActivity : FragmentActivity() {
     //  Barre de statut système (temp + CPU + RAM)
     // ══════════════════════════════════════════════════════════════════════════
     @Composable
-    fun SystemStatusBar(
-        settings: SettingsManager,
-        stats   : SystemStats?,
-        loading : Boolean
-    ) {
+    fun SystemStatusBar(settings: SettingsManager, stats: SystemStats?, loading: Boolean) {
         Card(modifier = Modifier.fillMaxWidth()) {
             Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp)) {
-
                 Text(
-                    text     = "${settings.username}@${settings.host}:${settings.port}",
-                    style    = MaterialTheme.typography.labelSmall,
-                    color    = MaterialTheme.colorScheme.onSurfaceVariant,
+                    text       = "${settings.username}@${settings.host}:${settings.port}",
+                    style      = MaterialTheme.typography.labelSmall,
+                    color      = MaterialTheme.colorScheme.onSurfaceVariant,
                     fontFamily = FontFamily.Monospace
                 )
-
                 Spacer(modifier = Modifier.height(10.dp))
-
                 when {
                     loading -> Row(
-                        verticalAlignment    = Alignment.CenterVertically,
+                        verticalAlignment     = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
-                        Text(
-                            "Chargement...",
+                        Text("Chargement…",
                             style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
+                            color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                     stats == null -> Text(
                         "⚠️ Impossible de lire les statistiques",
@@ -400,61 +482,45 @@ class MainActivity : FragmentActivity() {
                         color = MaterialTheme.colorScheme.error
                     )
                     else -> {
-                        // ── Blocs de stats ────────────────────────────────────
                         Row(
                             modifier              = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.SpaceEvenly
                         ) {
-                            // Température
                             StatBlock(
-                                emoji = tempEmoji(stats.tempCelsius),
-                                value = "%.1f°C".format(stats.tempCelsius),
-                                label = "Temp CPU",
-                                color = tempColor(stats.tempCelsius)
+                                "",
+                                "%.1f°C".format(stats.tempCelsius),
+                                "Temp CPU",
+                                tempColor(stats.tempCelsius)
                             )
-
                             VerticalDivider(
                                 modifier = Modifier.height(48.dp),
                                 color    = MaterialTheme.colorScheme.outlineVariant
                             )
-
-                            // Charge CPU
                             val cpuColor = when {
                                 stats.cpuPercent >= 80 -> Color(0xFFEF5350)
                                 stats.cpuPercent >= 50 -> Color(0xFFFF9800)
                                 else                   -> Color(0xFF66BB6A)
                             }
-                            StatBlock(
-                                emoji = "🖥️",
-                                value = "${stats.cpuPercent}%",
-                                label = "Charge CPU",
-                                color = cpuColor
-                            )
-
+                            StatBlock("🖥️", "${stats.cpuPercent}%", "Charge CPU", cpuColor)
                             VerticalDivider(
                                 modifier = Modifier.height(48.dp),
                                 color    = MaterialTheme.colorScheme.outlineVariant
                             )
-
-                            // RAM
                             val ramPercent = if (stats.ramTotalMb > 0)
-                                (stats.ramUsedMb * 100 / stats.ramTotalMb) else 0
+                                stats.ramUsedMb * 100 / stats.ramTotalMb else 0
                             val ramColor = when {
                                 ramPercent >= 85 -> Color(0xFFEF5350)
                                 ramPercent >= 65 -> Color(0xFFFF9800)
                                 else             -> Color(0xFF66BB6A)
                             }
                             StatBlock(
-                                emoji = "🧠",
-                                value = "${stats.ramUsedMb}/${stats.ramTotalMb} Mo",
-                                label = "RAM ($ramPercent%)",
-                                color = ramColor
+                                "🧠",
+                                "${stats.ramUsedMb}/${stats.ramTotalMb} Mo",
+                                "RAM ($ramPercent%)",
+                                ramColor
                             )
                         }
-
                         Spacer(modifier = Modifier.height(8.dp))
-
-                        // ── Barres de progression ─────────────────────────────
                         Row(
                             modifier              = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -470,7 +536,6 @@ class MainActivity : FragmentActivity() {
                                 color      = cpuColor,
                                 trackColor = MaterialTheme.colorScheme.surfaceVariant
                             )
-
                             val ramPct = if (stats.ramTotalMb > 0)
                                 stats.ramUsedMb.toFloat() / stats.ramTotalMb else 0f
                             val ramBarColor = when {
@@ -485,10 +550,9 @@ class MainActivity : FragmentActivity() {
                                 trackColor = MaterialTheme.colorScheme.surfaceVariant
                             )
                         }
-
                         Spacer(modifier = Modifier.height(4.dp))
                         Text(
-                            text  = "Mise à jour toutes les ${settings.tempRefreshMs / 1000} s",
+                            "Mise à jour toutes les ${settings.tempRefreshMs / 1000} s",
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -502,17 +566,13 @@ class MainActivity : FragmentActivity() {
     private fun StatBlock(emoji: String, value: String, label: String, color: Color) {
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
             Text(emoji, fontSize = 20.sp)
-            Text(
-                text       = value,
+            Text(value,
                 style      = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.Bold,
-                color      = color
-            )
-            Text(
-                text  = label,
+                color      = color)
+            Text(label,
                 style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
+                color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
     }
 
@@ -539,17 +599,14 @@ class MainActivity : FragmentActivity() {
                 .canAuthenticate(BIOMETRIC_STRONG or DEVICE_CREDENTIAL) == BiometricManager.BIOMETRIC_SUCCESS
         }
 
-        val themeOptions   = listOf("system" to "Système", "light" to "Clair", "dark" to "Sombre")
-        var selectedTheme  by remember { mutableStateOf(settings.theme) }
-
+        val themeOptions    = listOf("system" to "Système", "light" to "Clair", "dark" to "Sombre")
+        var selectedTheme   by remember { mutableStateOf(settings.theme) }
         val refreshOptions  = listOf(1000 to "1 s", 2000 to "2 s", 5000 to "5 s", 10000 to "10 s")
         var selectedRefresh by remember { mutableIntStateOf(settings.tempRefreshMs) }
-
         val timeoutOptions  = listOf(5000 to "5 s", 8000 to "8 s", 15000 to "15 s", 30000 to "30 s")
         var selectedTimeout by remember { mutableIntStateOf(settings.sshTimeoutMs) }
-
-        var shortcuts      by remember { mutableStateOf(settings.shortcuts) }
-        var showAddDialog  by remember { mutableStateOf(false) }
+        var shortcuts       by remember { mutableStateOf(settings.shortcuts) }
+        var showAddDialog   by remember { mutableStateOf(false) }
 
         Scaffold(
             topBar = {
@@ -571,75 +628,57 @@ class MainActivity : FragmentActivity() {
             }
         ) { padding ->
             Column(
-                modifier = Modifier
+                modifier            = Modifier
                     .padding(padding)
                     .padding(horizontal = 16.dp)
                     .fillMaxSize()
                     .verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                // ── Connexion SSH ─────────────────────────────────────────────
                 SectionTitle("Connexion SSH")
-                OutlinedTextField(
-                    value         = host,
-                    onValueChange = { host = it },
-                    label         = { Text("Adresse IP") },
-                    modifier      = Modifier.fillMaxWidth()
-                )
-                OutlinedTextField(
-                    value         = port.toString(),
+                OutlinedTextField(value = host, onValueChange = { host = it },
+                    label = { Text("Adresse IP") }, modifier = Modifier.fillMaxWidth())
+                OutlinedTextField(value = port.toString(),
                     onValueChange = { port = it.toIntOrNull() ?: 22 },
-                    label         = { Text("Port SSH") },
-                    modifier      = Modifier.fillMaxWidth()
-                )
-                OutlinedTextField(
-                    value         = username,
-                    onValueChange = { username = it },
-                    label         = { Text("Nom d'utilisateur") },
-                    modifier      = Modifier.fillMaxWidth()
-                )
-                OutlinedTextField(
-                    value                  = password,
-                    onValueChange          = { password = it },
-                    label                  = { Text("Mot de passe") },
-                    visualTransformation   = PasswordVisualTransformation(),
-                    modifier               = Modifier.fillMaxWidth()
-                )
+                    label = { Text("Port SSH") }, modifier = Modifier.fillMaxWidth())
+                OutlinedTextField(value = username, onValueChange = { username = it },
+                    label = { Text("Nom d'utilisateur") }, modifier = Modifier.fillMaxWidth())
+                OutlinedTextField(value = password, onValueChange = { password = it },
+                    label = { Text("Mot de passe") },
+                    visualTransformation = PasswordVisualTransformation(),
+                    modifier = Modifier.fillMaxWidth())
 
-                // ── Timeout ───────────────────────────────────────────────────
                 SectionTitle("Timeout SSH")
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     timeoutOptions.forEach { (ms, label) ->
                         FilterChip(
-                            selected  = selectedTimeout == ms,
-                            onClick   = { selectedTimeout = ms; settings.sshTimeoutMs = ms },
-                            label     = { Text(label) },
-                            modifier  = Modifier.weight(1f)
+                            selected = selectedTimeout == ms,
+                            onClick  = { selectedTimeout = ms; settings.sshTimeoutMs = ms },
+                            label    = { Text(label) },
+                            modifier = Modifier.weight(1f)
                         )
                     }
                 }
 
-                // ── Thème ─────────────────────────────────────────────────────
                 SectionTitle("Thème")
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     themeOptions.forEach { (value, label) ->
                         FilterChip(
-                            selected  = selectedTheme == value,
-                            onClick   = { selectedTheme = value; onThemeChanged(value) },
-                            label     = { Text(label) },
-                            modifier  = Modifier.weight(1f)
+                            selected = selectedTheme == value,
+                            onClick  = { selectedTheme = value; onThemeChanged(value) },
+                            label    = { Text(label) },
+                            modifier = Modifier.weight(1f)
                         )
                     }
                 }
 
-                // ── Sécurité ──────────────────────────────────────────────────
                 SectionTitle("Sécurité")
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text("Biométrie", modifier = Modifier.weight(1f))
                     Switch(
                         checked         = biometricEnabled,
                         onCheckedChange = {
-                            biometricEnabled        = it
+                            biometricEnabled          = it
                             settings.biometricEnabled = it
                             if (it) onBiometricEnabled()
                         },
@@ -647,35 +686,29 @@ class MainActivity : FragmentActivity() {
                     )
                 }
 
-                // ── Rafraîchissement ──────────────────────────────────────────
                 SectionTitle("Rafraîchissement température")
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     refreshOptions.forEach { (ms, label) ->
                         FilterChip(
-                            selected  = selectedRefresh == ms,
-                            onClick   = { selectedRefresh = ms; settings.tempRefreshMs = ms },
-                            label     = { Text(label) },
-                            modifier  = Modifier.weight(1f)
+                            selected = selectedRefresh == ms,
+                            onClick  = { selectedRefresh = ms; settings.tempRefreshMs = ms },
+                            label    = { Text(label) },
+                            modifier = Modifier.weight(1f)
                         )
                     }
                 }
 
-                // ── Raccourcis avec Drag & Drop ───────────────────────────────
                 SectionTitle("Raccourcis terminal")
-
                 ReorderableColumn(
                     list                = shortcuts,
                     onSettle            = { fromIndex, toIndex ->
-                        val updated = shortcuts.toMutableList().apply {
-                            add(toIndex, removeAt(fromIndex))
-                        }
-                        shortcuts         = updated
+                        val updated        = shortcuts.toMutableList().apply { add(toIndex, removeAt(fromIndex)) }
+                        shortcuts          = updated
                         settings.shortcuts = updated
                     },
                     modifier            = Modifier.fillMaxWidth(),
                     verticalArrangement = Arrangement.spacedBy(6.dp)
                 ) { index, shortcut, isDragging ->
-
                     key(shortcut.first) {
                         ReorderableItem {
                             val elevation by animateDpAsState(
@@ -683,8 +716,8 @@ class MainActivity : FragmentActivity() {
                                 label       = "shortcut_elevation"
                             )
                             Card(
-                                modifier = Modifier.fillMaxWidth(),
-                                colors   = CardDefaults.cardColors(
+                                modifier  = Modifier.fillMaxWidth(),
+                                colors    = CardDefaults.cardColors(
                                     containerColor = if (isDragging)
                                         MaterialTheme.colorScheme.surface
                                     else
@@ -693,43 +726,33 @@ class MainActivity : FragmentActivity() {
                                 elevation = CardDefaults.cardElevation(defaultElevation = elevation)
                             ) {
                                 Row(
-                                    modifier          = Modifier
-                                        .fillMaxWidth()
+                                    modifier          = Modifier.fillMaxWidth()
                                         .padding(horizontal = 12.dp, vertical = 10.dp),
                                     verticalAlignment = Alignment.CenterVertically
                                 ) {
                                     Icon(
                                         imageVector        = Icons.Default.DragHandle,
                                         contentDescription = "Déplacer",
-                                        modifier           = Modifier
-                                            .draggableHandle()
-                                            .padding(end = 12.dp),
-                                        tint = MaterialTheme.colorScheme.onSurfaceVariant
+                                        modifier           = Modifier.draggableHandle().padding(end = 12.dp),
+                                        tint               = MaterialTheme.colorScheme.onSurfaceVariant
                                     )
                                     Column(modifier = Modifier.weight(1f)) {
-                                        Text(
-                                            text       = shortcut.first,
+                                        Text(shortcut.first,
                                             style      = MaterialTheme.typography.bodyMedium,
                                             fontFamily = FontFamily.Monospace,
-                                            fontWeight = FontWeight.SemiBold
-                                        )
-                                        Text(
-                                            text       = shortcut.second,
+                                            fontWeight = FontWeight.SemiBold)
+                                        Text(shortcut.second,
                                             style      = MaterialTheme.typography.bodySmall,
                                             color      = MaterialTheme.colorScheme.primary,
-                                            fontFamily = FontFamily.Monospace
-                                        )
+                                            fontFamily = FontFamily.Monospace)
                                     }
                                     IconButton(onClick = {
-                                        val updated = shortcuts.toMutableList().apply { removeAt(index) }
-                                        shortcuts         = updated
+                                        val updated        = shortcuts.toMutableList().apply { removeAt(index) }
+                                        shortcuts          = updated
                                         settings.shortcuts = updated
                                     }) {
-                                        Icon(
-                                            imageVector        = Icons.Default.Delete,
-                                            contentDescription = "Supprimer",
-                                            tint               = MaterialTheme.colorScheme.error
-                                        )
+                                        Icon(Icons.Default.Delete, contentDescription = "Supprimer",
+                                            tint = MaterialTheme.colorScheme.error)
                                     }
                                 }
                             }
@@ -737,7 +760,6 @@ class MainActivity : FragmentActivity() {
                     }
                 }
 
-                // ── Bouton Enregistrer ────────────────────────────────────────
                 Button(
                     onClick  = {
                         settings.host     = host
@@ -746,12 +768,8 @@ class MainActivity : FragmentActivity() {
                         settings.password = password
                         onSave()
                     },
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(vertical = 16.dp)
-                ) {
-                    Text("Enregistrer la configuration")
-                }
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 16.dp)
+                ) { Text("Enregistrer la configuration") }
             }
         }
 
@@ -771,7 +789,6 @@ class MainActivity : FragmentActivity() {
         }
     }
 
-    // ── Dialog d'ajout de raccourci ───────────────────────────────────────────
     @Composable
     fun ShortcutDialog(
         initialLabel  : String,
@@ -809,9 +826,7 @@ class MainActivity : FragmentActivity() {
             },
             confirmButton = {
                 Button(
-                    onClick  = {
-                        if (label.isNotEmpty() && command.isNotEmpty()) onConfirm(label, command)
-                    },
+                    onClick  = { if (label.isNotEmpty() && command.isNotEmpty()) onConfirm(label, command) },
                     enabled  = label.isNotEmpty() && command.isNotEmpty()
                 ) { Text("Ajouter") }
             },
@@ -827,25 +842,27 @@ class MainActivity : FragmentActivity() {
     @OptIn(ExperimentalMaterial3Api::class)
     @Composable
     fun ControlScreen(
-        settings      : SettingsManager,
-        onOpenSettings: () -> Unit,
-        onOpenTerminal: () -> Unit,
-        onSshCommand  : (String, SettingsManager, (String) -> Unit) -> Unit,
-        onLed         : (Boolean, SettingsManager, (String) -> Unit) -> Unit
+        settings        : SettingsManager,
+        onOpenSettings  : () -> Unit,
+        onOpenTerminal  : () -> Unit,
+        onOpenDocker    : () -> Unit,
+        onOpenMonitoring: () -> Unit,
+        onOpenPiHole    : () -> Unit,
+        onOpenWireGuard : () -> Unit,
+        onSshCommand    : (String, SettingsManager, (String) -> Unit) -> Unit,
+        onLed           : (Boolean, SettingsManager, (String) -> Unit) -> Unit
     ) {
         var result  by remember { mutableStateOf("Prêt.") }
         var command by remember { mutableStateOf("") }
         var loading by remember { mutableStateOf(false) }
 
-        // ── Stats système (temp + CPU + RAM) ──────────────────────────────────
         var systemStats  by remember { mutableStateOf<SystemStats?>(null) }
         var statsLoading by remember { mutableStateOf(true) }
 
         LaunchedEffect(Unit) {
             while (true) {
                 statsLoading = systemStats == null
-                val stats    = fetchSystemStats(settings)
-                systemStats  = stats
+                systemStats  = fetchSystemStats(settings)
                 statsLoading = false
                 delay(settings.tempRefreshMs.toLong())
             }
@@ -856,6 +873,18 @@ class MainActivity : FragmentActivity() {
                 TopAppBar(
                     title   = { Text("Raspberry Controller") },
                     actions = {
+                        IconButton(onClick = onOpenMonitoring) {
+                            Icon(Icons.Default.BarChart, contentDescription = "Monitoring")
+                        }
+                        IconButton(onClick = onOpenDocker) {
+                            Icon(Icons.Default.Apps, contentDescription = "Docker")
+                        }
+                        IconButton(onClick = onOpenPiHole) {
+                            Icon(Icons.Default.Shield, contentDescription = "Pi-hole")
+                        }
+                        IconButton(onClick = onOpenWireGuard) {
+                            Icon(Icons.Default.VpnLock, contentDescription = "WireGuard")
+                        }
                         IconButton(onClick = onOpenTerminal) {
                             Icon(Icons.Default.Terminal, contentDescription = "Terminal")
                         }
@@ -867,21 +896,15 @@ class MainActivity : FragmentActivity() {
             }
         ) { padding ->
             Column(
-                modifier = Modifier
+                modifier            = Modifier
                     .padding(padding)
                     .padding(16.dp)
                     .fillMaxSize()
                     .verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                // ── Barre de statut système ───────────────────────────────────
-                SystemStatusBar(
-                    settings = settings,
-                    stats    = systemStats,
-                    loading  = statsLoading
-                )
+                SystemStatusBar(settings = settings, stats = systemStats, loading = statsLoading)
 
-                // ── GPIO LED ──────────────────────────────────────────────────
                 Card(modifier = Modifier.fillMaxWidth()) {
                     Column(
                         modifier            = Modifier.padding(16.dp),
@@ -890,18 +913,12 @@ class MainActivity : FragmentActivity() {
                         Text("GPIO - LED (pin 17)", style = MaterialTheme.typography.titleMedium)
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             Button(
-                                onClick  = {
-                                    loading = true
-                                    onLed(true, settings) { result = it; loading = false }
-                                },
+                                onClick  = { loading = true; onLed(true, settings) { result = it; loading = false } },
                                 modifier = Modifier.weight(1f),
                                 enabled  = !loading
                             ) { Text("Allumer") }
                             OutlinedButton(
-                                onClick  = {
-                                    loading = true
-                                    onLed(false, settings) { result = it; loading = false }
-                                },
+                                onClick  = { loading = true; onLed(false, settings) { result = it; loading = false } },
                                 modifier = Modifier.weight(1f),
                                 enabled  = !loading
                             ) { Text("Éteindre") }
@@ -909,7 +926,6 @@ class MainActivity : FragmentActivity() {
                     }
                 }
 
-                // ── Commande rapide ───────────────────────────────────────────
                 Card(modifier = Modifier.fillMaxWidth()) {
                     Column(
                         modifier            = Modifier.padding(16.dp),
@@ -935,7 +951,6 @@ class MainActivity : FragmentActivity() {
 
                 if (loading) LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
 
-                // ── Résultat ──────────────────────────────────────────────────
                 Card(
                     modifier = Modifier.fillMaxWidth(),
                     colors   = CardDefaults.cardColors(
